@@ -1,0 +1,482 @@
+model {
+  participationService = service 'Participation Service' {
+    description 'Join/leave, referral links; defers all capacity decisions to Deal Service'
+  }
+  dealService = service 'Deal Service' {
+    description 'Single arbiter of deal state: reserved_stock, authorized_count, timer'
+  }
+}
+
+views {
+
+  dynamic view dealJoinAuthorized {
+    title 'Deal Join 1 — Payment Authorized Within Timeout'
+
+    client -> participationService 'POST /deals/{id}/join'
+
+    participationService -> dealService 'reserve-slot  (sync, atomic guard)' {
+      notes '
+        UPDATE deals SET reserved_stock = reserved_stock + 1
+        WHERE id = ? AND reserved_stock < stock AND status IN (active, pending)
+      '
+    }
+    dealService -> participationService 'reserved OK  (reserved_stock++)'
+
+    participationService -> participationService 'insert participations row  (status = active)'
+    participationService -> kafka 'publish participant.joined  (async)' {
+      notes 'Event payload {participant_id, deal_id, user_id, product_id, price}'
+    }
+    participationService -> client '202 Accepted  "joined - payment processing"'
+
+    kafka -> orderService 'participant.joined'
+    orderService -> orderService 'create order (pending_authorization, payment_id NULL) + order_products' {
+      notes 'Dedup via processed_events + uq_orders_deal_participant'
+    }
+
+    orderService -> kafka 'publish order.payment_required  (async)' {
+      notes 'Event payload {order_id, amount, type="AUTHORIZE", idempotencyKey=orderId}'
+    }
+    kafka -> paymentService 'order.payment_required'
+    paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: manual)'
+    stripe -> paymentService 'succeeded'
+    paymentService -> kafka 'publish payment.authorized  (async)' {
+      notes 'Event payload {payment_id, order_id, amount}'
+    }
+    kafka -> orderService 'payment.authorized'
+    orderService -> orderService 'UPDATE status = authorized, payment_id  WHERE status = pending_authorization  (guard)'
+    orderService -> dealService 'authorize-slot'
+    dealService -> orderService 'authorized OK  (authorized_count++)'{
+      notes 'If this reaches stock, deal flips succeeded here'
+    }
+    orderService -> kafka 'publish order.authorized  (async)' {
+      notes 'Event payload {deal_id, participant_id}'
+    }
+
+    kafka -> notificationService 'order.authorized'
+    notificationService -> client 'push (WebSocket): "You are in - pending deal outcome"'
+
+    include
+      client,
+      participationService,
+      dealService,
+      orderService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealJoinDeclined {
+    title 'Deal Join 2 — Payment Declined (Async)'
+
+    client -> participationService 'POST /deals/{id}/join'
+    participationService -> dealService 'reserve-slot  (sync, atomic guard)'
+    dealService -> participationService 'reserved OK  (reserved_stock++)'
+    participationService -> participationService 'insert participations row  (status = active)'
+    participationService -> kafka 'publish participant.joined  (async)' {
+      notes 'Event payload {participant_id, deal_id, user_id, product_id, price}'
+    }
+    participationService -> client '202 Accepted  "joined - payment processing"'
+
+    kafka -> orderService 'participant.joined'
+    orderService -> orderService 'create order  (pending_authorization, payment_id NULL) + order_products'
+
+    orderService -> kafka 'publish order.payment_required  (async)' {
+      notes 'Event payload {order_id, amount, type="AUTHORIZE", idempotencyKey=orderId}'
+    }
+    kafka -> paymentService 'order.payment_required'
+    paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: manual)'
+    stripe -> paymentService 'card_declined  (Stripe test decline card)'
+    paymentService -> kafka 'publish payment.failed  (async)' {
+      notes 'Event payload {payment_id, order_id, amount, error: card_declined}'
+    }
+    kafka -> orderService 'payment.failed'
+
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_declined  WHERE status = pending_authorization  (guard)'
+    orderService -> dealService 'release-slot'
+    dealService -> orderService 'released OK  (reserved_stock--)'
+
+    orderService -> kafka 'publish order.deal_order_cancelled  (async)' {
+      notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: card_declined}'
+    }
+    kafka -> notificationService 'order.deal_order_cancelled'
+    notificationService -> client 'push: "Payment declined - you did not get a slot"'
+
+    kafka -> participationService 'order.deal_order_cancelled'
+    participationService -> participationService 'flip row to status = removed'
+
+    include
+      client,
+      participationService,
+      dealService,
+      orderService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealJoinRejectedInactive {
+    title 'Deal Join 3 — Rejected, Deal Already Resolved'
+
+    client -> participationService 'POST /deals/{id}/join'
+    participationService -> dealService 'reserve-slot  (sync, atomic guard)' {
+      notes 'Guard: WHERE reserved_stock < stock AND status IN (active, pending)'
+    }
+    dealService -> participationService '[R1] guard fails  (status = succeeded | failed | cancelled)' {
+      notes 'Zero rows affected by the guarded UPDATE - deal is no longer joinable'
+    }
+    participationService -> client '409 Conflict  {reason: DEAL_NOT_JOINABLE}' {
+      notes '
+        End of flow - nothing was written anywhere (no participations row,
+        no order, no payment call), so no compensation is needed.
+      '
+    }
+
+    include
+      client,
+      participationService,
+      dealService
+  }
+
+  dynamic view dealJoinNoOutcomeSweep {
+    title 'Deal Join 4 — No Payment Outcome, Force-Cancelled by Sweep'
+
+    client -> participationService 'POST /deals/{id}/join'
+    participationService -> dealService 'reserve-slot  (sync, atomic guard)'
+    dealService -> participationService 'reserved OK  (reserved_stock++)'
+    participationService -> participationService 'insert participations row  (status = active)'
+    participationService -> kafka 'publish participant.joined  (async)' {
+      notes 'Event payload {participant_id, deal_id, user_id, product_id, price}'
+    }
+    participationService -> client '202 Accepted  "joined - payment processing"'
+
+    kafka -> orderService 'participant.joined'
+    orderService -> orderService 'create order  (pending_authorization, payment_id NULL) + order_products'
+
+    orderService -> kafka 'publish order.payment_required  (async)' {
+      notes 'Event payload {order_id, amount, type="AUTHORIZE", idempotencyKey=orderId}'
+    }
+
+    kafka -> paymentService 'order.payment_required  — never produces an outcome event' {
+      notes '
+        Covers every silent-failure mode at once: consumer down, event
+        never delivered, Stripe down / hanging, or the outcome event
+        itself lost. From Order Service side these are indistinguishable:
+        it simply never receives payment.authorized or payment.declined.
+      '
+    }
+
+    orderService -> orderService 'reconciliation sweep  (runs every 15s)' {
+      notes '
+        Finds orders in status=pending_authorization older than 60s. No sync
+        call to Payment Service is made here - silence past the threshold
+        is itself the failure signal.
+      '
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_timeout  WHERE status = pending_authorization  (guard)' {
+      notes 'The guard makes the sweep and a late payment.authorized mutually exclusive (see Deal Join 5)'
+    }
+    orderService -> dealService 'release-slot'
+    dealService -> orderService 'released OK  (reserved_stock--)'
+
+    orderService -> kafka 'publish order.deal_order_cancelled  (async)' {
+      notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: payment_timeout}'
+    }
+
+    kafka -> paymentService 'order.deal_order_cancelled' {
+      notes '
+        Safety net: if a PaymentIntent for this orderId exists (the
+        authorize actually went through but payment.authorized was lost),
+        Payment Service voids it here. This is what makes force-cancel
+        safe without Order Service ever querying Payment Service directly.
+      '
+    }
+    kafka -> notificationService 'order.deal_order_cancelled'
+    notificationService -> client 'push: "We could not confirm your payment in time - you did not get a slot"'
+
+    kafka -> participationService 'order.deal_order_cancelled'
+    participationService -> participationService 'flip row to status = removed'
+
+    include
+      client,
+      participationService,
+      dealService,
+      orderService,
+      paymentService,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealJoinLateAuthorizedAfterSweep {
+    title 'Deal Join 5 — payment.authorized Arrives After Sweep Force-Cancel (Void)'
+
+    client -> participationService 'POST /deals/{id}/join'
+    participationService -> dealService 'reserve-slot'
+    dealService -> participationService 'reserved OK'
+    participationService -> participationService 'insert participations row  (status = active)'
+    participationService -> kafka 'publish participant.joined  (async)' {
+      notes 'Event payload {participant_id, deal_id, user_id, product_id, price}'
+    }
+    participationService -> client '202 Accepted  "joined - payment processing"'
+
+    kafka -> orderService 'participant.joined'
+    orderService -> orderService 'create order  (pending_authorization, payment_id NULL) + order_products'
+    orderService -> kafka 'publish order.payment_required  (async)' {
+      notes 'Event payload {order_id, amount, type="AUTHORIZE", idempotencyKey=orderId}'
+    }
+
+    kafka -> paymentService 'order.payment_required  (delivered very late — consumer lag / restart)'
+    paymentService -> stripe 'create + confirm PaymentIntent  (or Stripe is slow to respond)'
+
+    orderService -> orderService 'reconciliation sweep: pending_authorization > 60s → force-cancel' {
+      notes 'Same sweep as Deal Join 4 - it cannot tell "slow" from "dead"'
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_timeout  WHERE status = pending_authorization  (guard)'
+    orderService -> dealService 'release-slot'
+    dealService -> orderService 'released OK  (reserved_stock--)'
+    orderService -> kafka 'publish order.deal_order_cancelled  (async)' {
+      notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: payment_timeout}'
+    }
+    kafka -> notificationService 'order.deal_order_cancelled'
+    notificationService -> client 'push: "We could not confirm your payment in time - you did not get a slot"'
+    kafka -> participationService 'order.deal_order_cancelled'
+    participationService -> participationService 'flip row to status = removed'
+
+    stripe -> paymentService 'succeeded  (late)'
+    paymentService -> kafka 'publish payment.authorized  (async)' {
+      notes 'Event payload {payment_id, order_id, amount}'
+    }
+    kafka -> orderService 'payment.authorized  (async, after the cancel already committed)'
+    orderService -> orderService 'UPDATE status = authorized WHERE status = pending_authorization → 0 rows  - order already cancelled, event ignored' {
+      notes '
+        The status guard is the whole conflict-resolution mechanism - the
+        slot was already released (possibly to another participant) and
+        the order is never resurrected. The hold is voided below instead.
+      '
+    }
+
+    kafka -> paymentService 'order.deal_order_cancelled' {
+      notes '
+        Payment Service also consumes this event (same publish fanned out
+        to a second consumer, per Deal Join 4): a PaymentIntent now exists
+        for a cancelled order, so it is voided here rather than captured.
+      '
+    }
+    paymentService -> stripe 'cancel PaymentIntent  (hold exists for a cancelled order)'
+    stripe -> paymentService 'canceled'
+    paymentService -> kafka 'publish payment.voided  (async)' {
+      notes 'Event payload {order_id, payment_id, amount}'
+    }
+
+    include
+      client,
+      participationService,
+      dealService,
+      orderService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealSucceeded {
+    title 'Deal Join 6 — Deal Succeeded (Last Authorization Fills Capacity)'
+
+    kafka -> orderService 'payment.authorized  (the last remaining participant)' {
+      notes 'Abbreviated - full sequence (order.payment_required -> ... -> order.authorized) is identical to Deal Join 1'
+    }
+    orderService -> orderService 'UPDATE status = authorized, payment_id  WHERE status = pending_authorization  (guard)'
+    orderService -> dealService 'authorize-slot  (sync, as in Deal Join 1)'
+    dealService -> dealService 'authorized_count++; authorized_count == stock -> status = succeeded  (same transaction)'
+    dealService -> orderService 'authorized OK  (deal just flipped to succeeded)'
+    orderService -> kafka 'publish order.authorized  (async)' {
+      notes 'Event payload {deal_id, participant_id} - consumed by Notification Service only, as in Deal Join 1'
+    }
+
+    dealService -> kafka 'publish deal.succeeded  (async)' {
+      notes 'Event payload {deal_id, deal_stock, authorized_count}'
+    }
+
+    kafka -> orderService 'deal.succeeded'
+    orderService -> orderService 'batch: SELECT authorized orders WHERE deal_id = ? AND payment_id IS NOT NULL  FOR UPDATE SKIP LOCKED  -> status = pending_capture' {
+      notes 'Resumable, paginated - never one giant all-or-nothing transaction'
+    }
+
+    orderService -> kafka 'publish order.payment_required  (async, per order in the batch)' {
+      notes 'Event payload {order_id, payment_id, type="CAPTURE", idempotencyKey = payment_id}'
+    }
+    kafka -> paymentService 'order.payment_required  (type=CAPTURE)'
+    paymentService -> stripe 'capture PaymentIntent'
+    stripe -> paymentService 'succeeded'
+    paymentService -> kafka 'publish payment.captured  (async)' {
+      notes 'Event payload {order_id, payment_id, amount}'
+    }
+    kafka -> orderService 'payment.captured' {
+      notes '
+        Repeated for every order in the batch, isolated per order.
+        Capture failures are not modeled - team decision is to be
+        optimistic on this path: a hold captured within its validity
+        window is assumed to succeed.
+      '
+    }
+    orderService -> orderService 'UPDATE status = confirmed  WHERE status = pending_capture  (guard, per order)'
+    orderService -> kafka 'publish order.created  (async, per order)' {
+      notes 'Event payload {order_id, user_id, items}'
+    }
+
+    orderService -> orderService 'reconciliation sweep  (60s)' {
+      notes '
+        Same sweep job as Deal Join 4/5, extended to this stage: any order
+        still status=pending_capture past 60s (order.payment_required type=CAPTURE
+        lost, or Payment Service down) is safely re-published, not
+        force-cancelled - unlike the join stage, capture is idempotent on
+        payment_id, so a retry is always the correct move here.
+      '
+    }
+
+    kafka -> notificationService 'order.created  (async, per order)'
+    notificationService -> client 'push: "Deal succeeded! Your order is confirmed"' {
+      notes 'client here represents every captured participant'
+    }
+
+    kafka -> inventoryService 'deal.succeeded'
+    inventoryService -> inventoryService 'UPDATE inventory SET deal_stock = deal_stock - {deal_stock}, stock = stock - {authorized_count}  WHERE product_id = ?'
+
+    include
+      client,
+      dealService,
+      orderService,
+      inventoryService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealFailed {
+    title 'Deal Join 7 — Deal Failed (Timer Expires Below Minimum)'
+
+    dealService -> dealService 'internal timer fires at end_time' {
+      notes '
+        UPDATE deals SET status = CASE WHEN authorized_count >= min_participants
+        THEN succeeded ELSE failed END WHERE id = ? AND status = active
+        -- this run: authorized_count < min_participants -> failed
+      '
+    }
+    dealService -> kafka 'publish deal.failed  (async)' {
+      notes 'Event payload {deal_id, deal_stock, authorized_count}'
+    }
+
+    kafka -> orderService 'deal.failed'
+    orderService -> orderService 'batch: SELECT authorized orders WHERE deal_id = ? AND payment_id IS NOT NULL  FOR UPDATE SKIP LOCKED  -> status = pending_void' 
+
+    orderService -> kafka 'publish order.payment_required  (async, per order in the batch)' {
+      notes 'Event payload {order_id, payment_id, type="VOID", idempotencyKey = payment_id}'
+    }
+    kafka -> paymentService 'order.payment_required  (type=VOID)'
+    paymentService -> stripe 'cancel PaymentIntent'
+    stripe -> paymentService 'canceled'
+    paymentService -> kafka 'publish payment.voided  (async)' {
+      notes 'Event payload {order_id, payment_id, amount}'
+    }
+    kafka -> orderService 'payment.voided' {
+      notes 'Repeated for every authorized order in the batch'
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = deal_failed  WHERE status = pending_void  (guard, per order)'
+    orderService -> kafka 'publish order.deal_order_cancelled  (async, per order)' {
+      notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: deal_failed}'
+    }
+
+    orderService -> orderService 'reconciliation sweep  (60s)' {
+      notes 'Same sweep job, same idempotent-retry logic as the capture path in Deal Join 6'
+    }
+
+    kafka -> notificationService 'order.deal_order_cancelled  (async, per order)'
+    notificationService -> client 'push: "Deal did not reach its minimum - your hold was released"' {
+      notes 'client here represents every participant who had a hold placed'
+    }
+
+    kafka -> inventoryService 'deal.failed'
+    inventoryService -> inventoryService 'UPDATE inventory SET deal_stock = deal_stock - {deal_stock}  WHERE product_id = ?'
+
+    include
+      client,
+      dealService,
+      orderService,
+      inventoryService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view dealParticipantLeave {
+    title 'Deal Join 8 — Participant Leaves While Deal Is Running (>10 min Remaining)'
+
+    client -> participationService 'POST /participations/{id}/leave'
+
+    participationService -> dealService 'check-leave-eligible  (sync, atomic guard)' {
+      notes '
+        UPDATE deals ... WHERE id = ? AND status IN (active, pending)
+        AND now() < end_time - INTERVAL 10 minutes
+        Sync because the buyer is waiting on this response - mirrors
+        reserve-slot on the join side, eligibility is decided by Deal Service.
+      '
+    }
+    dealService -> participationService 'eligible'
+
+    participationService -> participationService 'flip row to status = removed'
+    participationService -> kafka 'publish participant.left  (async)' {
+      notes 'Event payload {participant_id, deal_id, user_id, order_id}'
+    }
+    participationService -> client '202 Accepted  "leave requested - processing"'
+
+    kafka -> orderService 'participant.left'
+    orderService -> orderService 'find order  WHERE deal_id = ? AND participant_id = ?  (status = authorized)'
+    orderService -> orderService 'UPDATE status = pending_void  WHERE status = authorized  (guard)' {
+      notes '
+        Parks the order in pending_void before the VOID is fired - the
+        same intermediate state the deal.failed batch uses, so a
+        concurrent deal.succeeded/deal.failed batch over this deal_id
+        can no longer race this order (the batch selects WHERE status =
+        authorized and skips it).
+      '
+    }
+
+    orderService -> kafka 'publish order.payment_required  (async)' {
+      notes 'Event payload {order_id, payment_id, type="VOID", idempotencyKey = payment_id}'
+    }
+    kafka -> paymentService 'order.payment_required  (type=VOID)'
+    paymentService -> stripe 'cancel PaymentIntent  (release the hold)'
+    stripe -> paymentService 'canceled'
+    paymentService -> kafka 'publish payment.voided  (async)' {
+      notes 'Event payload {order_id, payment_id, amount}'
+    }
+    kafka -> orderService 'payment.voided'
+
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = participant_left  WHERE status = pending_void  (guard)'
+    orderService -> dealService 'release-slot  (sync, guarded WHERE status = active)' {
+      notes 'Also decrements authorized_count, since this participant had a hold placed - mirrors reserve-slot at join'
+    }
+    dealService -> orderService 'released OK  (reserved_stock--, authorized_count--)'
+
+    orderService -> kafka 'publish order.deal_order_cancelled  (async)' {
+      notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: participant_left}'
+    }
+
+    kafka -> notificationService 'order.deal_order_cancelled'
+    notificationService -> client 'push: "You left the deal - your hold was released"'
+
+    include
+      client,
+      participationService,
+      dealService,
+      orderService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+}

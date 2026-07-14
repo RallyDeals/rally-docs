@@ -1,0 +1,483 @@
+specification {
+  element actor {
+    style { shape person }
+  }
+  element service
+  element external
+  element queue
+}
+
+model {
+  client = actor 'Buyer / Client'
+
+  orderService = service 'Order Service' {
+    description 'Owns orders for both deal and normal purchases; only caller of Payment Service'
+  }
+  catalogService = service 'Catalog Service'
+  inventoryService = service 'Inventory Service'
+  paymentService = service 'Payment Service' {
+    description 'Deal-blind ledger; backed by Stripe (test mode)'
+  }
+  stripe = external 'Stripe (test mode)'
+  notificationService = service 'Notification Service'
+  kafka = queue 'Kafka'
+}
+
+views {
+
+  dynamic view orderCreationHappyPath {
+    title 'Order Creation — Happy Path'
+
+    client -> orderService 'POST /orders  { userId, items[] }'
+
+    orderService -> catalogService 'POST /products/lookup  { productIds }  (sync)' {
+      notes '
+        Fetches authoritative unitPrice per product.
+        Client-supplied price is never trusted.
+        Any notFound would fail with 400 here, before any order row exists.
+      '
+    }
+    catalogService -> orderService '{ found, notFound }'
+
+    orderService -> orderService 'create order (status=reserving) + order_products rows' {
+      notes '
+        Order row is durable BEFORE reservation is attempted — this is what
+        gives order-reserve a real orderId to dedupe against, and what lets
+        the reconciliation sweep recover a crash mid-reservation-loop.
+      '
+    }
+
+    orderService -> inventoryService 'POST /inventory/{productId}/order-reserve  (sync, per item)' {
+      notes '
+        Atomic guard: UPDATE inventory SET stock = stock - ?
+        WHERE product_id = ? AND stock >= ?
+        orderId is persisted per (orderId, productId) — this record is the
+        source of truth order-release later checks against.
+      '
+    }
+    inventoryService -> orderService 'reserved OK  (all items)'
+
+    orderService -> orderService 'status = pending_charge'
+
+    orderService -> kafka 'publish order.payment_required'{
+      notes 'Event payload: { orderId, amount, idempotencyKey=orderId, type="CHARGE"}'
+    }
+
+    orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT, totalPrice, items }' {
+      notes '
+        Returned as soon as payment_required is durably published — the
+        request path is sync only with Catalog and Inventory; it never
+        waits on Payment Service or Stripe. The buyer learns the final
+        outcome via notification or by polling GET /orders/{orderId}.
+      '
+    }
+
+    kafka -> paymentService 'order.payment_required'
+    paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: automatic)'
+    stripe -> paymentService 'succeeded'
+    paymentService -> kafka 'publish payment.charged ' {
+      notes 'Event payload: {payment_id, order_id, amount}'
+    }
+    kafka -> orderService 'payment.charged'
+
+    orderService -> orderService 'UPDATE status = confirmed, payment_id WHERE status = pending_charge  (guard)' {
+      notes 'Guard keeps this a no-op if the sweep force-cancelled first'
+    }
+    orderService -> kafka 'publish order.created '{
+      notes 'Event payload {order_id, user_id, items}'
+    }
+    kafka -> notificationService 'order.created   → buyer notified: order confirmed'
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationCatalogUnreachable {
+    title 'Order Creation — Catalog Service Unreachable'
+
+    client -> orderService 'POST /orders  { userId, items[] }'
+
+    orderService -> catalogService 'POST /products/lookup  { productIds }  (sync)' {
+      notes 'Connection fails / times out — Catalog Service unreachable'
+    }
+
+    orderService -> orderService 'no order row created' {
+      notes '
+        This fails before the durable order row is written, so there is
+        nothing for the reconciliation sweep to clean up and no
+        compensating event to publish — Inventory was never touched.
+      '
+    }
+
+    orderService -> client '503 Service Unavailable'
+
+    include
+      client,
+      orderService,
+      catalogService
+  }
+
+  dynamic view orderCreationProductNotFound {
+    title 'Order Creation — Product Not Found in Catalog'
+
+    client -> orderService 'POST /orders  { userId, items: [1, 2] }'
+
+    orderService -> catalogService 'POST /products/lookup  { productIds: [1, 2] }  (sync)'
+    catalogService -> orderService '{ found: [1], notFound: [2] }' {
+      notes 'Product 2 does not exist (or is not currently sellable) in Catalog'
+    }
+
+    orderService -> orderService 'no order row created' {
+      notes '
+        Rejected before persistence, same as the unreachable case — the
+        client-facing contract is "fail fast, before touching Inventory"
+        for any Catalog-stage problem, known or unknown product.
+      '
+    }
+
+    orderService -> client '400 Bad Request  { reason: PRODUCT_NOT_FOUND, productIds: [2] }'
+
+    include
+      client,
+      orderService,
+      catalogService
+  }
+
+  dynamic view orderCreationInsufficientStock {
+    title 'Order Creation — Insufficient Stock Mid-Cart'
+
+    client -> orderService 'POST /orders  (2 items)'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+
+    orderService -> inventoryService 'POST /inventory/1/order-reserve' {
+      notes 'Succeeds — stock decremented, reservation record persisted for (orderId, 1)'
+    }
+    inventoryService -> orderService 'reserved OK'
+
+    orderService -> inventoryService 'POST /inventory/2/order-reserve' {
+      notes 'Fails — guarded UPDATE affects 0 rows (insufficient stock)'
+    }
+    inventoryService -> orderService '409  { error: insufficient_stock }'
+
+    orderService -> orderService 'status = cancelled, cancel_reason = insufficient_stock' {
+      notes '
+        No synchronous order-release call anymore. Order Service only
+        updates the row and publishes — it never calls Inventory Service
+        to undo a reservation directly, in any branch.
+      '
+    }
+    orderService -> kafka 'publish order.normal_order_cancelled ' {
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    orderService -> client '409 Conflict  { reason: INSUFFICIENT_STOCK, productId: 2 }' {
+      notes 'Returned immediately — does not wait for the async release below'
+    }
+
+    kafka -> inventoryService 'order.normal_order_cancelled '
+    inventoryService -> inventoryService 'release item 1  (matching reservation found)'
+    inventoryService -> inventoryService 'item 2: no-op  (no matching reservation — never actually reserved)'
+    kafka -> notificationService 'order.normal_order_cancelled '
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationInventoryUnreachable {
+    title 'Order Creation — Inventory Service Unreachable Mid-Reservation'
+
+    client -> orderService 'POST /orders  (2 items)'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+
+    orderService -> inventoryService 'POST /inventory/1/order-reserve' {
+      notes 'Succeeds — stock decremented'
+    }
+    inventoryService -> orderService 'reserved OK'
+
+    orderService -> inventoryService 'POST /inventory/2/order-reserve' {
+      notes 'Connection fails / times out — Inventory Service unreachable'
+    }
+
+    orderService -> orderService 'status = cancelled, cancel_reason = inventory_unreachable' {
+      notes '
+        No compensating call is attempted here (the service is already
+        unreachable — that call would just fail too). The order.normal_order_cancelled
+        publish is durable via the outbox, so release happens whenever
+        Inventory Service comes back, regardless of when that is.
+      '
+    }
+    orderService -> kafka 'publish order.normal_order_cancelled '{
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    orderService -> client '503 Service Unavailable'
+
+    kafka -> inventoryService 'order.normal_order_cancelled  (async, once Inventory Service is back)'
+    inventoryService -> inventoryService 'release item 1  (matching reservation found)'
+    inventoryService -> inventoryService 'item 2: no-op  (never actually reserved)'
+    kafka -> notificationService 'order.normal_order_cancelled '
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationPaymentDeclined {
+    title 'Order Creation — Payment Declined (Async Fast Path)'
+
+    client -> orderService 'POST /orders'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+    orderService -> inventoryService 'order-reserve  (all items)'
+    inventoryService -> orderService 'reserved OK'
+    orderService -> orderService 'status = pending_charge'
+
+    orderService -> kafka 'publish order.payment_required'{
+      notes 'Event payload: { orderId, amount, idempotencyKey=orderId, type="CHARGE"}'
+    }
+
+    orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT }' {
+      notes '
+        The client is never told "declined" on the create request — the
+        decline happens after the HTTP exchange is already over. The
+        buyer finds out via notification or by polling the order, which
+        will read CANCELLED / PAYMENT_DECLINED.
+      '
+    }
+
+    kafka -> paymentService 'order.payment_required'
+    paymentService -> stripe 'create + confirm PaymentIntent'
+    stripe -> paymentService 'card_declined  (Stripe test decline card)'
+    paymentService -> kafka 'publish payment.failed '{
+      notes 'Even payload: { payment_id, order_id, amount, error: card_declined } '
+    }
+
+    kafka -> orderService 'payment.failed '
+
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_declined WHERE status = pending_charge  (guard)'
+    orderService -> kafka 'publish order.normal_order_cancelled'{
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    kafka -> inventoryService 'order.normal_order_cancelled   → release stock  (all items)'
+    kafka -> notificationService 'order.normal_order_cancelled   → buyer notified: payment declined'
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationPaymentNoOutcome {
+    title 'Order Creation — No Payment Outcome, Force-Cancelled by Sweep'
+
+    client -> orderService 'POST /orders'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+    orderService -> inventoryService 'order-reserve  (all items)'
+    inventoryService -> orderService 'reserved OK'
+    orderService -> orderService 'status = pending_charge'
+
+    orderService -> kafka 'publish order.payment_required'{
+      notes 'Event payload: { orderId, amount, idempotencyKey=orderId, type="CHARGE"}'
+    }
+
+    orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT }'
+
+    kafka -> paymentService 'order.payment_required  — never produces an outcome event' {
+      notes '
+        Covers every silent-failure mode at once: consumer down, event
+        never delivered, Stripe down / hanging, or the outcome event
+        itself lost. From Order Service side these are indistinguishable:
+        it simply never receives payment.charged or payment.failed.
+      '
+    }
+
+    orderService -> orderService 'reconciliation sweep  (runs every 60s)' {
+      notes '
+        Finds orders in status=pending_charge older than 5 minutes.
+        Deliberately makes NO sync call to Payment Service — that would
+        re-introduce the coupling this design removes. Silence past the
+        threshold is itself treated as the failure signal.
+      '
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_timeout WHERE status = pending_charge  (guard)' {
+      notes '
+        The guard makes the sweep and a late payment.charged mutually
+        exclusive — whichever commits first wins, the other becomes a
+        no-op (see the late-charge view for the losing side).
+      '
+    }
+    orderService -> kafka 'publish order.normal_order_cancelled'{
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    kafka -> inventoryService 'order.normal_order_cancelled   → release stock  (all items)'
+    kafka -> paymentService 'order.normal_order_cancelled ' {
+      notes '
+        Payment Service consumes order.normal_order_cancelled too: if a PaymentIntent
+        for this orderId exists (charge actually went through but the
+        payment.charged event was lost), it cancels/voids it. This is
+        what makes force-cancel safe without querying Payment Service.
+      '
+    }
+    kafka -> notificationService 'order.normal_order_cancelled   → buyer notified: order cancelled'
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      paymentService,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationLateChargeAfterSweep {
+    title 'Order Creation — payment.charged Arrives After Sweep Force-Cancel (void)'
+
+    client -> orderService 'POST /orders'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+    orderService -> inventoryService 'order-reserve  (all items)'
+    inventoryService -> orderService 'reserved OK'
+    orderService -> orderService 'status = pending_charge'
+
+    orderService -> kafka 'publish order.payment_required'{
+      notes 'Event payload: { orderId, amount, idempotencyKey=orderId, type="CHARGE"}'
+    }
+
+    orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT }'
+
+    kafka -> paymentService 'order.payment_required  (delivered very late — consumer lag / restart)'
+    paymentService -> stripe 'create + confirm PaymentIntent  (or Stripe is slow to respond)'
+
+    orderService -> orderService 'reconciliation sweep: pending_charge > 5 min → force-cancel' {
+      notes 'Same sweep as the no-outcome view — it cannot tell "slow" from "dead"'
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = payment_timeout WHERE status = pending_charge  (guard)'
+    orderService -> kafka 'publish order.normal_order_cancelled'{
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    kafka -> inventoryService 'order.normal_order_cancelled   → release stock  (all items)'
+    kafka -> notificationService 'order.normal_order_cancelled   → buyer notified: order cancelled'
+
+    stripe -> paymentService 'succeeded  (late)'
+    paymentService -> kafka 'publish payment.charged'  {
+      notes 'Event payload:  { payment_id, order_id, amount }'
+    }
+    kafka -> orderService 'payment.charged  (async, after the cancel already committed)'
+    orderService -> orderService 'UPDATE ... WHERE status = pending_charge → 0 rows  — order already cancelled, event ignored' {
+      notes '
+        The status guard is the whole conflict-resolution mechanism:
+        the order is never resurrected. The buyer was already told
+        "cancelled"; the money is returned below instead.
+      '
+    }
+
+    kafka -> paymentService 'order.normal_order_cancelled ' {
+      notes '
+        If Payment Service consumes order.normal_order_cancelled BEFORE it has charged,
+        it marks the order cancelled and skips / aborts the charge instead.
+        Either way the invariant holds: a cancelled order never keeps money.
+      '
+    }
+    paymentService -> stripe 'void PaymentIntent  (charge exists for a cancelled order)'
+    stripe -> paymentService 'voided'
+    paymentService -> kafka 'publish payment.voided' {
+      notes 'Event payload:  { payment_id, order_id, amount }'
+    }
+    kafka -> notificationService 'payment.voided   → buyer notified: charge voided'
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      paymentService,
+      stripe,
+      kafka,
+      notificationService
+  }
+
+  dynamic view orderCreationCrashMidReservation {
+    title 'Order Creation — Process Crash Mid-Reservation (Orphan Recovery)'
+
+    client -> orderService 'POST /orders  (2 items)'
+    orderService -> catalogService 'POST /products/lookup'
+    catalogService -> orderService '{ found, notFound }'
+    orderService -> orderService 'create order (status=reserving) + order_products rows'
+
+    orderService -> inventoryService 'POST /inventory/1/order-reserve'
+    inventoryService -> orderService 'reserved OK'
+
+    orderService -> orderService 'process crashes  (before item 2 is reserved, before any client response)' {
+      notes '
+        No response was ever sent to the client for this request — the
+        connection simply dropped. Recovery from here is entirely the
+        sweep job below; nothing about this path is synchronous.
+      '
+    }
+
+    orderService -> orderService 'reconciliation sweep  (runs every 60s)' {
+      notes '
+        Order has been in status=reserving for > 2 minutes — that status
+        normally lives only for the duration of one HTTP request (a few
+        seconds), so persisting past it means the process died mid-loop.
+        Shorter threshold than pending_charge (5 min) because there is
+        no third party (Stripe) whose latency we need to wait out.
+      '
+    }
+    orderService -> orderService 'UPDATE status = cancelled, cancel_reason = reservation_incomplete WHERE status = reserving  (guard)'
+    orderService -> kafka 'publish order.normal_order_cancelled '{
+      notes 'Event payload: { orderId, userId, items: [1, 2] }'
+    }
+
+    kafka -> inventoryService 'order.normal_order_cancelled '
+    inventoryService -> inventoryService 'release item 1  (matching reservation found)'
+    inventoryService -> inventoryService 'item 2: no-op  (never actually reserved)'
+    kafka -> notificationService 'order.normal_order_cancelled '
+
+    include
+      client,
+      orderService,
+      catalogService,
+      inventoryService,
+      kafka,
+      notificationService
+  }
+
+}
