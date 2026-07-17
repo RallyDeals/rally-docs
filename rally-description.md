@@ -1,9 +1,4 @@
 # GroupDeal — Architecture & Decisions Log
-> Internship graduation project — Spring Boot + Angular microservices platform
-> Team size: 6 | Duration: 3–4 weeks
-> Status: living document, updated after team meeting
-
----
 
 ## 1. Concept Summary
 
@@ -99,20 +94,8 @@ deal's status directly.
 | POST | `/deals/{id}/reserve-slot` | **Internal, sync.** Called by Participation Service on join. Atomically reserves one slot if capacity allows. |
 | POST | `/deals/{id}/release-slot` | **Internal, sync.** Called by Participation Service on leave, and by Order Service if a payment authorization fails. |
 
-**DB:**
-```
-deals(
-  id, product_id, seller_id,
-  discount_price,
-  stock, reserved_stock,      -- deal-level cap, separate from Inventory Service's stock
-  min_participants,           -- minimum headcount required for the deal to succeed; enforced at creation: min_participants <= stock
-  status,                     -- pending | active | succeeded | failed | cancelled
-  start_time,                 -- set on first join
-  duration_minutes,
-  end_time,                   -- computed: start_time + duration_minutes, once started
-  created_at
-)
-```
+**DB:** `deals(id, product_id, seller_id, discount_price, stock, reserved_stock, min_participants,
+  status, start_time, duration_minutes, end_time, created_at)`
 
 **Resolution rule (unifies both end triggers into one condition):** a deal succeeds if
 `reserved_stock >= min_participants` at the moment it resolves — whichever trigger caused
@@ -133,7 +116,7 @@ evaluate true by construction.
 filling the stock cap without any cross-service coordination.
 
 **Communication:**
-- Sync: exposes `reserve-slot` / `release-slot` to Participation Service (atomic guards, see Section 7).
+- Sync: exposes `reserve-slot` / `release-slot` to Participation Service
 - Async (publishes): `deal.created`, `deal.cancelled`, `deal.succeeded`, `deal.failed`
 - Async (subscribes): none.
 
@@ -144,8 +127,8 @@ recording anything.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/deals/{id}/join` | Buyer joins — calls Deal Service's `reserve-slot` sync first; only records the participation and fires the event if the reservation succeeds |
-| DELETE | `/deals/{id}/leave` | Buyer leaves — checks with Deal Service that >10 min remain and the deal is still `active`, then calls `release-slot` sync (frees the reserved slot immediately) before firing the event |
+| POST | `/deals/{id}/join` | Buyer joins |
+| DELETE | `/deals/{id}/leave` | Buyer leaves |
 | GET | `/deals/{id}/participants` | List/count participants |
 | GET | `/deals/{id}/progress` | Live progress (count / cap, time remaining) |
 | POST | `/deals/{id}/invite-link` | Generate referral link |
@@ -163,17 +146,15 @@ is validated against — and reserves from — this at deal-creation time.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/inventory/{productId}/reserve` | Reserve units for a new deal (called by Deal Service on creation) |
-| POST | `/inventory/{productId}/release` | Release units (deal cancelled, or deal failed by timer expiry) |
+| POST | `/inventory/{productId}/reserve-deal` | Reserve units for a new deal (called by Deal Service on creation) |
+| POST | `/inventory/{productId}/release-deal` | Release units (deal cancelled, or deal failed by timer expiry) |
+| POST | `/inventory/{productId}/reserve-order` | Reserve units for a normal order |
+| POST | `/inventory/{productId}/release-order` | Release units for a normal order on payment failure |
 | GET | `/inventory/{productId}` | Current stock / reserved stock |
 
 **DB:** `inventory(id, product_id, stock, reserved_stock)`
 
 ### 4.7 Order Service
-Owns **every** order in the system — both deal-sourced and normal purchases — and is the
-only service that talks to Payment Service. This is what keeps Payment Service fully
-generic (Section 4.8): Order Service is the sole thing that understands "this order came
-from a deal."
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -181,53 +162,19 @@ from a deal."
 | GET | `/orders/{id}` | Order status (with line items) |
 | GET | `/users/{id}/orders` | User's order history |
 
-**DB:**
-```
-orders(
-  id, user_id,
-  order_type,          -- NORMAL | DEAL
-  deal_id,              -- nullable, only for DEAL
-  participant_id,        -- nullable, only for DEAL
-  status,               -- pending_payment | confirmed | cancelled
-  total_price,
-  created_at
-)
-
-order_products(
-  id, order_id, product_id,
-  quantity,             -- always 1 for DEAL orders; can be >1 for NORMAL cart items
-  unit_price,           -- base_price (NORMAL) or the deal's discount_price (DEAL)
-  created_at
-)
-```
-
-**Deal flow (three sub-scenarios, all keyed by `deal_id`/`participant_id`):**
-1. **Join** — on `participant.joined`: create `order` (`type=DEAL`, `status=pending_payment`, `deal_id`, `participant_id`, `total_price = deal.discount_price`) + one `order_products` row (`quantity=1`, `unit_price = deal.discount_price`). Then call Payment Service to authorize a hold for `total_price` against this `order_id`.
-2. **Leave** — on `participant.left`: find the order by `(deal_id, participant_id)`, set `status=cancelled`, emit `order.cancelled` → Payment Service voids the matching payment.
-3. **Payment authorization declined** — on `payment.failed`: set that order's `status=cancelled`, and call Deal Service's `release-slot` synchronously so the freed slot can be taken by someone else. Without this step a declined card would silently strand a reserved slot forever (see Section 7).
-4. **Deal resolves:**
-   - `deal.succeeded` → select all `pending_payment` orders for that `deal_id`, set `status=confirmed`, emit `order.created` per order → Payment Service captures each matching payment.
-   - `deal.failed` → select all `pending_payment` orders for that `deal_id`, set `status=cancelled`, emit `order.cancelled` per order → Payment Service voids each matching payment.
-
-**Normal purchase flow:** buyer checks out a cart → Order Service creates the `order`
-(`type=NORMAL`, no `deal_id`/`participant_id`) and its `order_products` rows, computes
-`total_price`, then synchronously authorizes and immediately captures via Payment Service
-(no hold period — there's no group mechanic to wait on), and marks the order `confirmed`.
+**DB:** `orders(id, user_id,order_type, deal_id, participant_id, status, total_price, payment_id, payment_intent_id, created_at)
+order_products(id, order_id, product_id, quantity, unit_price, created_at)`
 
 **Communication:**
-- Async (subscribes): `participant.joined` (create pending order + authorize), `participant.left` (cancel order + void), `payment.failed` (cancel order + release deal slot), `deal.succeeded` (confirm + capture all), `deal.failed` (cancel + void all)
-- Async (publishes): `order.created`, `order.cancelled`
-- Sync: calls Payment Service (authorize/capture/void), calls Deal Service's `release-slot` (on payment failure)
+- Async (subscribes): `participant.joined`, `participant.left`, `payment.failed`, `payment.authorized`, `payment.captured`, `payment.charged`,`payment.voided`, `deal.succeeded`, `deal.failed`
+- Async (publishes): `order.created`, `order.normal_order_cancelled`, `order.deal_order_cancelled`, `order.payment_initiation_requested` (type=CHARGE/AUTHORIZE — new charge/hold, carries `user_id` + `amount` + `payment_intent_id`), `order.payment_settlement_requested` (type=CAPTURE/VOID — acts on an existing `payment_id`), `order.authorized`
 
 ### 4.8 Payment Service
-A fully generic, **deal-blind** ledger, backed by **Stripe in test mode** — real Stripe API
-calls (test keys, test card numbers), not an in-house mock. It never knows whether an
-`order_id` came from a deal or a normal purchase — it only ever authorizes, captures, or
-voids a given amount against a given order, on request from Order Service.
 
 Maps onto Stripe's PaymentIntents API with manual capture:
 - `authorize` → create a PaymentIntent with `capture_method: manual` and confirm it (places the hold)
 - `capture` → call Stripe's capture endpoint on that PaymentIntent (can capture less than or equal to the authorized amount)
+- `charge` → create a PaymentIntent with `capture_method: automatic`
 - `void` → cancel the PaymentIntent
 - Declines are real Stripe responses (triggered in test mode via Stripe's documented test card numbers, e.g. a card number that always declines), not something the team fakes — `payment.failed` is published when Stripe itself returns a decline.
 
@@ -235,17 +182,15 @@ Maps onto Stripe's PaymentIntents API with manual capture:
 |---|---|---|
 | POST | `/payments/authorize` | Hold `amount` against an `order_id` |
 | POST | `/payments/capture` | Capture a previously authorized payment |
+| POST | `/payments/charge` | Directly charge amount for normal orders |
 | POST | `/payments/void` | Void a previously authorized payment |
 | GET | `/payments/{id}` | Payment detail |
 
-**DB:** `payments(id, order_id, amount, status, idempotency_key, created_at)` — `status`: `authorized` / `captured` / `voided`
+**DB:** `payments(id, order_id, amount, status, payment_intent_id, idempotency_key, created_at)` — `status`: `authorized` / `captured` / `charged` / `voided`; `payment_intent_id` (Stripe "pi_...") is echoed back in every `payment.*` event payload
 
 **Communication:**
-- Sync: called directly by Order Service for every authorize/capture/void — no event
-  listening on deal or participant events at all. This is the actual fix for the original
-  coupling problem: Payment Service has zero knowledge of `deal_id`/`participant_id`/tiers;
-  all of that context lives only on Order Service's `orders` row.
-- Async (publishes): `payment.authorized`, `payment.captured`, `payment.voided`, `payment.failed` (real Stripe decline, e.g. via Stripe's test decline card numbers — consumed by Order Service to trigger its compensation, see Section 4.7)
+- Async (subscribes): `order.payment_initiation_requested` (create + confirm the PaymentIntent — CHARGE or AUTHORIZE), `order.payment_settlement_requested` (capture/void the existing PaymentIntent by `payment_id`), `order.normal_order_cancelled` / `order.deal_order_cancelled` (safety net: void any PaymentIntent that exists for a cancelled order).
+- Async (publishes): `payment.authorized`, `payment.charged`, `payment.captured`, `payment.voided`, `payment.failed` (real Stripe decline, e.g. via Stripe's test decline card numbers — consumed by Order Service to trigger its compensation, see Section 4.7) — every `payment.*` payload includes `payment_intent_id`
 
 ### 4.9 Notification Service
 | Method | Endpoint | Description |
@@ -258,54 +203,68 @@ Maps onto Stripe's PaymentIntents API with manual capture:
 
 ---
 
-## 6. Deal Lifecycle (State Machine)
+## 6. NORMAL ORDER flow
 
 ```
-pending  --(first join succeeds)-->  active  --(reserved_stock == stock)-->  succeeded
-   |                                    |
-   |                                    --(end_time reached, reserved_stock >= min_participants)--> succeeded
-   |                                    --(end_time reached, reserved_stock <  min_participants)--> failed
-   --(seller cancels, no joins yet)--> cancelled
+ (start)
+    │  POST /orders — catalog lookup ok, order + order_products row inserted
+    ▼
+ reserving ──────────────────────────────────────────► cancelled [insufficient_stock]
+    │                                                       (inventory-reserve returns 409
+    │                                                        on any line item)
+    │
+    ├──────────────────────────────────────────────────► cancelled [inventory_unreachable]
+    │                                                       (Inventory Service unreachable
+    │                                                        mid-reservation loop)
+    │
+    ├──────────────────────────────────────────────────► cancelled [reservation_incomplete]
+    │                                                       (sweep: stuck in `reserving` > 2 min
+    │                                                        — process crashed mid-loop)
+    │
+    │  all items reserved
+    ▼
+ pending_charge ────────────────────────────────────────► confirmed
+    │                                                       (payment.charged consumed)
+    │
+    ├──────────────────────────────────────────────────► cancelled [payment_declined]
+    │                                                       (payment.failed consumed)
+    │
+    └──────────────────────────────────────────────────► cancelled [payment_timeout]
+                                                            (sweep: stuck in `pending_charge`
+                                                             > 5 min)
 ```
 
-- **`pending`**: deal created, visible, joinable, but not yet started. No `start_time` set.
-- **`active`**: set on first successful join. `start_time = now()`, `end_time = start_time + duration_minutes` computed and stored.
-- **`succeeded`**: reached either by filling `stock` (always implies `min_participants` was already met, since `min_participants <= stock` is enforced at creation) or by the timer expiring with `reserved_stock >= min_participants`. Triggers the success saga (confirm + capture all pending orders for the deal).
-- **`failed`**: reached only by the timer expiring with `reserved_stock < min_participants`. Triggers the compensation saga (cancel + void all pending orders, release inventory).
-- **`cancelled`**: only reachable from `pending`.
+## 7. DEAL ORDER flow
 
-Both `succeeded` and `failed` are only reachable from `active`, and both are guarded by the
-same atomic condition, so a deal can never land in both (see Section 7).
+```
+ (start)
+    │  participant.joined consumed — order + order_products row inserted
+    ▼
+ pending_authorization ─────────────────────────────────► authorized
+    │                                                       (payment.authorized consumed)
+    │
+    ├──────────────────────────────────────────────────► cancelled [payment_declined]
+    │                                                       (payment.failed consumed)
+    │
+    └──────────────────────────────────────────────────► cancelled [payment_timeout]
+                                                            (sweep: stuck in
+                                                             `pending_authorization` > 60s)
 
----
+ authorized ─────────────────────────────────────────────► pending_capture
+    │            (deal.succeeded batch: SELECT ... WHERE status='authorized' FOR UPDATE
+    │             SKIP LOCKED → status='pending_capture')
+    │
+    ├──────────────────────────────────────────────────► pending_void
+    │            (deal.failed batch: same pattern → status='pending_void')
+    │
+    └──────────────────────────────────────────────────► pending_void
+                 (participant.left consumed → guarded UPDATE WHERE status='authorized'
+                  parks the order → order.payment_settlement_requested VOID fired)
 
-## 7. Concurrency Pattern — Atomic Guarded Updates
+ pending_capture ────────────────────────────────────────► confirmed
+                 (payment.captured consumed)
 
-Every capacity-sensitive operation in this system uses the same pattern: a conditional
-`UPDATE ... WHERE <still-valid-state>`, so the database itself resolves races instead of
-a distributed lock.
-
-| Operation | Owner | Guard |
-|---|---|---|
-| Reserve a join slot | Deal Service | `UPDATE deals SET reserved_stock = reserved_stock + 1 WHERE id = ? AND reserved_stock < stock AND status = 'active'` (or `'pending'` if this is the first join) |
-| Release a slot (leave, or a declined payment) | Deal Service | `UPDATE deals SET reserved_stock = reserved_stock - 1 WHERE id = ? AND status = 'active'` — called synchronously by Participation Service on leave, and by Order Service if `payment.failed` fires |
-| Flip to `succeeded` | Deal Service | Same transaction as the reserve-slot update above — if it results in `reserved_stock = stock`, flip `status` to `succeeded` (always true here, since `min_participants <= stock` is enforced at creation) and emit `deal.succeeded`. |
-| Flip to `succeeded` or `failed` on timer expiry | Deal Service | Fired by Deal Service's own internal timer job at `end_time`: `UPDATE deals SET status = CASE WHEN reserved_stock >= min_participants THEN 'succeeded' ELSE 'failed' END WHERE id = ? AND status = 'active'` |
-| Reserve deal stock from product inventory | Inventory Service | `UPDATE inventory SET reserved_stock = reserved_stock + ? WHERE product_id = ? AND (stock - reserved_stock) >= ?` |
-
----
-
-## 8. Event Catalog
-
-| Event | Publisher | Consumers | Purpose |
-|---|---|---|---|
-| `deal.created` | Deal Service | (future: analytics) | Deal now live/pending |
-| `deal.cancelled` | Deal Service | Inventory Service (release reserved stock) | Seller cancelled pre-join |
-| `deal.succeeded` | Deal Service | Order Service, Notification Service, Inventory Service | Timer expired with `min_participants` met, or stock cap filled — start success saga |
-| `deal.failed` | Deal Service | Order Service, Notification Service, Inventory Service (release reserved stock) | Timer expired with `min_participants` unmet — start compensation saga |
-| `participant.joined` | Participation Service | Order Service (create pending order + authorize), Notification Service (join confirmation + progress) | Safe, reversible reactions only |
-| `participant.left` | Participation Service | Order Service (cancel order + void) | Individual withdrawal before deal resolves — slot already released synchronously by Participation Service itself |
-| `payment.failed` | Payment Service | Order Service (cancel that order + release the deal slot via Deal Service) | Real Stripe authorization decline (test mode) |
-| `order.created` | Order Service | Notification Service | New order (normal purchase, or a deal order confirmed on success) |
-| `order.cancelled` | Order Service | Notification Service | Order cancelled (leave, payment decline, or deal failure) |
-| `payment.authorized` / `.captured` / `.voided` | Payment Service | Notification Service (optional) | Payment state changes |
+ pending_void ───────────────────────────────────────────► cancelled [deal_failed | participant_left]
+                 (payment.voided consumed; cancel_reason depends on which path
+                  parked the order in pending_void)
+```
