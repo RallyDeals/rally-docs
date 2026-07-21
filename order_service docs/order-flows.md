@@ -185,9 +185,11 @@ therefore skips anything already parked.
 | Event | Payload | Fired by |
 |---|---|---|
 | `participant.joined` | `{participant_id, deal_id, user_id, product_id, price, payment_intent_id}` | Participation Service |
-| `participant.left` | `{participant_id, deal_id, user_id, order_id}` | Participation Service |
-| `order.payment_initiation_requested` | `{user_id, order_id, amount, type: 'AUTHORIZE'\|'CHARGE', payment_intent_id, idempotencyKey = order_id}` — creates a **new** charge/hold; no `payment_id` exists yet | Order Service |
-| `order.payment_settlement_requested` | `{payment_id, type: 'CAPTURE'\|'VOID', idempotencyKey = payment_id}` — acts on an **existing** payment; `payment_id` alone identifies it | Order Service |
+| `participant.left` | `{participant_id, deal_id}` | Participation Service |
+| `order.payment_charge_required` | `{user_id, order_id, amount, payment_intent_id, idempotencyKey = order_id}` | Order Service |
+| `order.payment_authorize_required` | `{user_id, order_id, amount, payment_intent_id, idempotencyKey = order_id}` | Order Service |
+| `order.payment_void_required` | `{payment_id, idempotencyKey = payment_id}` | Order Service |
+| `order.payment_capture_required` | `{payment_id, idempotencyKey = payment_id}` | Order Service |
 | `payment.authorized` | `{payment_id, payment_intent_id, order_id, amount}` | Payment Service |
 | `payment.charged` | `{payment_id, payment_intent_id, order_id, amount}` | Payment Service |
 | `payment.captured` | `{payment_id, payment_intent_id, order_id, amount}` | Payment Service |
@@ -206,12 +208,15 @@ therefore skips anything already parked.
 
 | Event | Payload | Fired when... |
 |---|---|---|
-| `Order.payment_initiation_requested` | `(user_id, order_id, amount, type: CHARGE \| AUTHORIZE, payment_intent_id)` | 1. A NORMAL order finishes inventory reservation → `reserving → pending_charge` (type=CHARGE)<br>2. A DEAL order is created from `participant.joined` → `pending_authorization` (type=AUTHORIZE) |
-| `Order.payment_settlement_requested` | `(payment_id, type: CAPTURE \| VOID)` | 1. `deal.succeeded` batch converts `authorized → pending_capture` (type=CAPTURE)<br>2. `deal.failed` batch converts `authorized → pending_void` (type=VOID)<br>3. `participant.left` is consumed → guarded UPDATE parks the order `authorized → pending_void` (type=VOID) |
+| `order.payment_charge_required` | `{user_id, order_id, amount, payment_intent_id, idempotencyKey = order_id}` | 1. A NORMAL order finishes inventory reservation → `reserving → pending_charge`|
+| `order.payment_authorize_required` | `{user_id, order_id, amount, payment_intent_id, idempotencyKey = order_id}` | 1. A DEAL order is created from `participant.joined` → `pending_authorization` |
+| `order.payment_capture_required` | `{payment_id, idempotencyKey = payment_id}` | 1. `deal.succeeded` batch converts `authorized → pending_capture` |
+| `order.payment_void_required` | `{payment_id, idempotencyKey = payment_id}` | 1. `deal.failed` batch converts `authorized → pending_void` <br>2. `participant.left` is consumed → guarded UPDATE parks the order `authorized → pending_void` |
 | `Order.created` | `(order_id, user_id, items)` | 1. Order Service consumes `payment.charged` (NORMAL, `pending_charge → confirmed`)<br>2. Order Service consumes `payment.captured` (DEAL, `pending_capture → confirmed`) |
 | `Order.authorized` | `(deal_id, participant_id)` | 1. Order Service consumes `payment.authorized` (`pending_authorization → authorized`) |
-| `Order.normal_order_cancelled` | `(order_id, user_id, [{product_id, quantity}])` | 1. Inventory Service unreachable mid-reservation<br>2. Insufficient stock on a line item<br>3. Order Service consumes `payment.failed` on a NORMAL order (`pending_charge`)<br>4. Sweep force-cancels a NORMAL order stuck in `pending_charge` (payment timeout)<br>5. Sweep force-cancels a NORMAL order stuck in `reserving` (crash mid-reservation) |
-| `Order.deal_order_cancelled` | `(order_id, deal_id, participant_id, user_id, items, reason)` | 1. Order Service consumes `payment.failed` on a DEAL order in `pending_authorization`<br>2. Sweep force-cancels a DEAL order stuck in `pending_authorization` (no payment outcome, or a late `payment.authorized` arriving after the sweep already fired)<br>3. `deal.failed` batch: order voided (`pending_void → cancelled`, reason `deal_failed`)<br>4. `participant.left` consumed and the void completes (`authorized → cancelled`, reason `participant_left`) |
+| `Order.normal_order_cancelled` | `(order_id, user_id, [{product_id, quantity}])` | 1. Inventory Service unreachable mid-reservation<br>2. Insufficient stock on a line item<br>3. Order Service consumes `payment.failed` on a NORMAL order (`pending_charge`) |
+| `Order.deal_order_cancelled` | `(order_id, deal_id, participant_id, user_id, items, reason)` | 1. Order Service consumes `payment.failed` on a DEAL order in `pending_authorization`<br>2. `deal.failed` batch: order voided (`pending_void → cancelled`, reason `deal_failed`)<br>3. `participant.left` consumed and the void completes (`authorized → cancelled`, reason `participant_left`) |
+| `Order.payment_timeout` | `(order_id, idempotencyKey=order_id)` | 1. Sweep force-cancels a NORMAL order stuck in `pending_charge` (payment timeout)<br>2. Sweep force-cancels a NORMAL order stuck in `reserving` (crash mid-reservation)<br>3. Sweep force-cancels a DEAL order stuck in `pending_authorization` (no payment outcome, or a late `payment.authorized` arriving after the sweep already fired)|
 ---
 
 ## 5. Subscribers of Order Service's Events
@@ -221,13 +226,14 @@ therefore skips anything already parked.
 | `Order.created` | Notification Service | Send confirmation email |
 | `Order.authorized` | Notification Service | Push: "You are in — pending deal outcome" — Notification is this event's **only** subscriber; Deal Service's `authorized_count++` happens via the sync `authorize-slot` RPC, not by consuming this event (see correction below) |
 | `Order.normal_order_cancelled` | Inventory Service | Release stock using the `items` list in the payload |
+| `Order.normal_order_cancelled` | Participation Service | Convert status to `removed` |
 | `Order.normal_order_cancelled` | Notification Service | Send email |
-| `Order.normal_order_cancelled` | Payment Service | Safety net: if a charge for this `order_id` actually went through before the cancel (event race), void/cancel it *(drawn in the no-outcome-sweep flow, missing from your original list)* |
 | `Order.deal_order_cancelled` | Notification Service | Push notify buyer of the outcome |
-| `Order.deal_order_cancelled` | Participation Service | Convert participation row to `removed` |
-| `Order.deal_order_cancelled` | Payment Service | Safety net: if a PaymentIntent exists for this order (authorize succeeded but the event was lost, or a hold exists for a now-cancelled order), void it *(drawn in the sweep-timeout flows, missing from your original list)* |
-| `Order.payment_initiation_requested` | Payment Service | Create + confirm the Stripe PaymentIntent identified by `payment_intent_id` (`type=CHARGE`: capture automatic, `type=AUTHORIZE`: capture manual) given `user_id` + `order_id` + `amount` |
-| `Order.payment_settlement_requested` | Payment Service | Capture (`type=CAPTURE`) or cancel (`type=VOID`) the **existing** PaymentIntent looked up by `payment_id` |
+| `order.payment_charge_required` | Payment Service | Charge the amount using paymentIntentId |
+| `order.payment_authorize_required` | Payment Service | Authorize the amount using paymentIntentId |
+| `order.payment_capture_required` | Payment Service | Capture the held amount |
+| `order.payment_void_required` | Payment Service | Release the held amount |
+| `Order.payment_timeout` | Payment Service | To cancel any order stucked |
 
 ---
 
@@ -241,7 +247,7 @@ therefore skips anything already parked.
 | `Payment.captured` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_capture` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. Fire `Order.created` |
 | `Payment.voided` | `(order_id, payment_id, payment_intent_id, amount)` | *(not in your list, but present in every void path)* 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard) with `cancel_reason` = `deal_failed` or `participant_left` depending on which path parked the order in `pending_void`<br>3. On the leave path only: call `release-slot` on Deal Service (sync — `reserved_stock--`, `authorized_count--`)<br>4. Fire `Order.deal_order_cancelled` |
 | `Participant.joined` | `(participant_id, deal_id, user_id, product_id, price, payment_intent_id)` | 1. Create order row, `status = pending_authorization`, `payment_intent_id` from the event (+ `order_products` row)<br>2. Fire `Order.payment_initiation_requested(user_id, order_id, amount, 'AUTHORIZE', payment_intent_id)` |
-| `Participant.left` | `(participant_id, deal_id, user_id, order_id)` | 1. Find the **existing** order `WHERE deal_id = ? AND participant_id = ? AND status = authorized` — no new row is created<br>2. `UPDATE status = pending_void WHERE status = authorized` (guard — parks the order so deal-resolution batches skip it)<br>3. Fire `Order.payment_settlement_requested(payment_id, 'VOID')` |
+| `Participant.left` | `(participant_id, deal_id)` | 1. Find the **existing** order `WHERE deal_id = ? AND participant_id = ? AND status = authorized` — no new row is created<br>2. `UPDATE status = pending_void WHERE status = authorized` (guard — parks the order so deal-resolution batches skip it)<br>3. Fire `Order.payment_settlement_requested(payment_id, 'VOID')` |
 | `Deal.succeeded` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: `SELECT ... WHERE deal_id = ? AND status = authorized FOR UPDATE SKIP LOCKED` → `status = pending_capture`<br>2. Fire `Order.payment_settlement_requested(payment_id, 'CAPTURE')` per order |
 | `Deal.failed` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: same pattern → `status = pending_void`<br>2. Fire `Order.payment_settlement_requested(order_id, payment_id, 'VOID')` per order |
 

@@ -33,10 +33,10 @@ views {
       notes 'Dedup via processed_events + uq_orders_deal_participant'
     }
 
-    orderService -> kafka 'publish order.payment_initiation_requested  (async)' {
-      notes 'Event payload {user_id, order_id, amount, type="AUTHORIZE", payment_intent_id, idempotencyKey=order_id}'
+    orderService -> kafka 'publish order.payment_authorize_requested  (async)' {
+      notes 'Event payload {user_id, order_id, amount, payment_intent_id, idempotencyKey=order_id}'
     }
-    kafka -> paymentService 'order.payment_initiation_requested'
+    kafka -> paymentService 'order.payment_authorize_requested'
     paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: manual)'
     stripe -> paymentService 'succeeded'
     paymentService -> kafka 'publish payment.authorized  (async)' {
@@ -81,10 +81,10 @@ views {
     kafka -> orderService 'participant.joined'
     orderService -> orderService 'create order  (pending_authorization, payment_intent_id from event, payment_id NULL) + order_products'
 
-    orderService -> kafka 'publish order.payment_initiation_requested  (async)' {
-      notes 'Event payload {user_id, order_id, amount, type="AUTHORIZE", payment_intent_id, idempotencyKey=order_id}'
+    orderService -> kafka 'publish order.payment_authorize_requested  (async)' {
+      notes 'Event payload {user_id, order_id, amount, payment_intent_id, idempotencyKey=order_id}'
     }
-    kafka -> paymentService 'order.payment_initiation_requested'
+    kafka -> paymentService 'order.payment_authorize_requested'
     paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: manual)'
     stripe -> paymentService 'card_declined  (Stripe test decline card)'
     paymentService -> kafka 'publish payment.failed  (async)' {
@@ -154,11 +154,11 @@ views {
     kafka -> orderService 'participant.joined'
     orderService -> orderService 'create order  (pending_authorization, payment_intent_id from event, payment_id NULL) + order_products'
 
-    orderService -> kafka 'publish order.payment_initiation_requested  (async)' {
-      notes 'Event payload {user_id, order_id, amount, type="AUTHORIZE", payment_intent_id, idempotencyKey=order_id}'
+    orderService -> kafka 'publish order.payment_authorize_requested  (async)' {
+      notes 'Event payload {user_id, order_id, amount, payment_intent_id, idempotencyKey=order_id}'
     }
 
-    kafka -> paymentService 'order.payment_initiation_requested  — never produces an outcome event' {
+    kafka -> paymentService 'order.payment_authorize_requested  — never produces an outcome event' {
       notes '
         Covers every silent-failure mode at once: consumer down, event
         never delivered, Stripe down / hanging, or the outcome event
@@ -184,7 +184,12 @@ views {
       notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: payment_timeout}'
     }
 
-    kafka -> paymentService 'order.deal_order_cancelled' {
+    orderService -> kafka 'publish order.payment_timeout  (async)' {
+      notes 'Event payload {order_id}'
+    }
+
+
+    kafka -> paymentService 'order.payment_timeout' {
       notes '
         Safety net: if a PaymentIntent for this orderId exists (the
         authorize actually went through but payment.authorized was lost),
@@ -222,11 +227,11 @@ views {
 
     kafka -> orderService 'participant.joined'
     orderService -> orderService 'create order  (pending_authorization, payment_intent_id from event, payment_id NULL) + order_products'
-    orderService -> kafka 'publish order.payment_initiation_requested  (async)' {
-      notes 'Event payload {user_id, order_id, amount, type="AUTHORIZE", payment_intent_id, idempotencyKey=order_id}'
+    orderService -> kafka 'publish order.payment_authorize_requested  (async)' {
+      notes 'Event payload {user_id, order_id, amount, payment_intent_id, idempotencyKey=order_id}'
     }
 
-    kafka -> paymentService 'order.payment_initiation_requested  (delivered very late — consumer lag / restart)'
+    kafka -> paymentService 'order.payment_authorize_requested'
     paymentService -> stripe 'create + confirm PaymentIntent  (or Stripe is slow to respond)'
 
     orderService -> orderService 'reconciliation sweep: pending_authorization > 60s → force-cancel' {
@@ -237,6 +242,9 @@ views {
     dealService -> orderService 'released OK  (reserved_stock--)'
     orderService -> kafka 'publish order.deal_order_cancelled  (async)' {
       notes 'Event payload {order_id, deal_id, participant_id, user_id, items, reason: payment_timeout}'
+    }
+    orderService -> kafka 'publish order.payment_timeout  (async)' {
+      notes 'Event payload {order_id}'
     }
     kafka -> notificationService 'order.deal_order_cancelled'
     notificationService -> client 'push: "We could not confirm your payment in time - you did not get a slot"'
@@ -256,7 +264,7 @@ views {
       '
     }
 
-    kafka -> paymentService 'order.deal_order_cancelled' {
+    kafka -> paymentService 'order.payment_timeout' {
       notes '
         Payment Service also consumes this event (same publish fanned out
         to a second consumer, per Deal Join 4): a PaymentIntent now exists
@@ -284,7 +292,7 @@ views {
     title 'Deal Join 6 — Deal Succeeded (Last Authorization Fills Capacity)'
 
     kafka -> orderService 'payment.authorized  (the last remaining participant)' {
-      notes 'Abbreviated - full sequence (order.payment_initiation_requested -> ... -> order.authorized) is identical to Deal Join 1'
+      notes 'Abbreviated - full sequence (order.payment_authorize_requested -> ... -> order.authorized) is identical to Deal Join 1'
     }
     orderService -> orderService 'UPDATE status = authorized, payment_id, payment_intent_id  WHERE status = pending_authorization  (guard)'
     orderService -> dealService 'authorize-slot  (sync, as in Deal Join 1)'
@@ -303,10 +311,10 @@ views {
       notes 'Resumable, paginated - never one giant all-or-nothing transaction'
     }
 
-    orderService -> kafka 'publish order.payment_settlement_requested  (async, per order in the batch)' {
-      notes 'Event payload {payment_id, type="CAPTURE", idempotencyKey = payment_id}'
+    orderService -> kafka 'publish order.payment_capture_requested  (async, per order in the batch)' {
+      notes 'Event payload {payment_id, idempotencyKey = payment_id}'
     }
-    kafka -> paymentService 'order.payment_settlement_requested  (type=CAPTURE)'
+    kafka -> paymentService 'order.payment_capture_requested  (type=CAPTURE)'
     paymentService -> stripe 'capture PaymentIntent'
     stripe -> paymentService 'succeeded'
     paymentService -> kafka 'publish payment.captured  (async)' {
@@ -328,7 +336,7 @@ views {
     orderService -> orderService 'reconciliation sweep  (60s)' {
       notes '
         Same sweep job as Deal Join 4/5, extended to this stage: any order
-        still status=pending_capture past 60s (order.payment_settlement_requested type=CAPTURE
+        still status=pending_capture past 60s (order.payment_capture_requested
         lost, or Payment Service down) is safely re-published, not
         force-cancelled - unlike the join stage, capture is idempotent on
         payment_id, so a retry is always the correct move here.
@@ -371,10 +379,10 @@ views {
     kafka -> orderService 'deal.failed'
     orderService -> orderService 'batch: SELECT authorized orders WHERE deal_id = ? AND payment_id IS NOT NULL  FOR UPDATE SKIP LOCKED  -> status = pending_void' 
 
-    orderService -> kafka 'publish order.payment_settlement_requested  (async, per order in the batch)' {
-      notes 'Event payload {payment_id, type="VOID", idempotencyKey = payment_id}'
+    orderService -> kafka 'publish order.payment_void_requested  (async, per order in the batch)' {
+      notes 'Event payload {payment_id, idempotencyKey = payment_id}'
     }
-    kafka -> paymentService 'order.payment_settlement_requested  (type=VOID)'
+    kafka -> paymentService 'order.payment_void_requested'
     paymentService -> stripe 'cancel PaymentIntent'
     stripe -> paymentService 'canceled'
     paymentService -> kafka 'publish payment.voided  (async)' {
@@ -444,10 +452,10 @@ views {
       '
     }
 
-    orderService -> kafka 'publish order.payment_settlement_requested  (async)' {
-      notes 'Event payload {payment_id, type="VOID", idempotencyKey = payment_id}'
+    orderService -> kafka 'publish order.payment_void_requested  (async)' {
+      notes 'Event payload {payment_id, idempotencyKey = payment_id}'
     }
-    kafka -> paymentService 'order.payment_settlement_requested  (type=VOID)'
+    kafka -> paymentService 'order.payment_void_requested'
     paymentService -> stripe 'cancel PaymentIntent  (release the hold)'
     stripe -> paymentService 'canceled'
     paymentService -> kafka 'publish payment.voided  (async)' {

@@ -59,20 +59,20 @@ views {
 
     orderService -> orderService 'status = pending_charge'
 
-    orderService -> kafka 'publish order.payment_initiation_requested'{
-      notes 'Event payload: { userId, orderId, amount, paymentIntentId, idempotencyKey=orderId, type="CHARGE"}'
+    orderService -> kafka 'publish order.payment_charge_requested'{
+      notes 'Event payload: { userId, orderId, amount, paymentIntentId, idempotencyKey=orderId}'
     }
 
     orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT, totalPrice, items }' {
       notes '
-        Returned as soon as payment_initiation_requested is durably published — the
+        Returned as soon as payment_charge_requested is durably published — the
         request path is sync only with Catalog and Inventory; it never
         waits on Payment Service or Stripe. The buyer learns the final
         outcome via notification or by polling GET /orders/{orderId}.
       '
     }
 
-    kafka -> paymentService 'order.payment_initiation_requested'
+    kafka -> paymentService 'order.payment_charge_requested'
     paymentService -> stripe 'create + confirm PaymentIntent  (capture_method: automatic)'
     stripe -> paymentService 'succeeded'
     paymentService -> kafka 'publish payment.charged ' {
@@ -256,7 +256,7 @@ views {
     inventoryService -> orderService 'reserved OK'
     orderService -> orderService 'status = pending_charge'
 
-    orderService -> kafka 'publish order.payment_initiation_requested'{
+    orderService -> kafka 'publish order.payment_charge_requested'{
       notes 'Event payload: { userId, orderId, amount, paymentIntentId, idempotencyKey=orderId, type="CHARGE"}'
     }
 
@@ -269,7 +269,7 @@ views {
       '
     }
 
-    kafka -> paymentService 'order.payment_initiation_requested'
+    kafka -> paymentService 'order.payment_charge_requested'
     paymentService -> stripe 'create + confirm PaymentIntent'
     stripe -> paymentService 'card_declined  (Stripe test decline card)'
     paymentService -> kafka 'publish payment.failed '{
@@ -309,13 +309,13 @@ views {
     inventoryService -> orderService 'reserved OK'
     orderService -> orderService 'status = pending_charge'
 
-    orderService -> kafka 'publish order.payment_initiation_requested'{
+    orderService -> kafka 'publish order.payment_charge_requested'{
       notes 'Event payload: { userId, orderId, amount, paymentIntentId, idempotencyKey=orderId, type="CHARGE"}'
     }
 
     orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT }'
 
-    kafka -> paymentService 'order.payment_initiation_requested  — never produces an outcome event' {
+    kafka -> paymentService 'order.payment_charge_requested  — never produces an outcome event' {
       notes '
         Covers every silent-failure mode at once: consumer down, event
         never delivered, Stripe down / hanging, or the outcome event
@@ -342,9 +342,13 @@ views {
     orderService -> kafka 'publish order.normal_order_cancelled'{
       notes 'Event payload: { orderId, userId, items: [1, 2] }'
     }
+    orderService -> kafka 'publish order.payment_timeout'{
+      notes 'Event payload: { orderId }'
+    }
+
 
     kafka -> inventoryService 'order.normal_order_cancelled   → release stock  (all items)'
-    kafka -> paymentService 'order.normal_order_cancelled ' {
+    kafka -> paymentService 'order.payment_timeout ' {
       notes '
         Payment Service consumes order.normal_order_cancelled too: if a PaymentIntent
         for this orderId exists (charge actually went through but the
@@ -375,13 +379,13 @@ views {
     inventoryService -> orderService 'reserved OK'
     orderService -> orderService 'status = pending_charge'
 
-    orderService -> kafka 'publish order.payment_initiation_requested'{
+    orderService -> kafka 'publish order.payment_charge_requested'{
       notes 'Event payload: { userId, orderId, amount, paymentIntentId, idempotencyKey=orderId, type="CHARGE"}'
     }
 
     orderService -> client '201 Created  { orderId, status: PENDING_PAYMENT }'
 
-    kafka -> paymentService 'order.payment_initiation_requested  (delivered very late — consumer lag / restart)'
+    kafka -> paymentService 'order.payment_charge_requested  (delivered very late — consumer lag / restart)'
     paymentService -> stripe 'create + confirm PaymentIntent  (or Stripe is slow to respond)'
 
     orderService -> orderService 'reconciliation sweep: pending_charge > 5 min → force-cancel' {
@@ -391,6 +395,10 @@ views {
     orderService -> kafka 'publish order.normal_order_cancelled'{
       notes 'Event payload: { orderId, userId, items: [1, 2] }'
     }
+    orderService -> kafka 'publish order.payment_timeout'{
+      notes 'Event payload: { orderId }'
+    }
+
 
     kafka -> inventoryService 'order.normal_order_cancelled   → release stock  (all items)'
     kafka -> notificationService 'order.normal_order_cancelled   → buyer notified: order cancelled'
@@ -408,9 +416,9 @@ views {
       '
     }
 
-    kafka -> paymentService 'order.normal_order_cancelled ' {
+    kafka -> paymentService 'order.payment_timeout' {
       notes '
-        If Payment Service consumes order.normal_order_cancelled BEFORE it has charged,
+        If Payment Service consumes order.payment_timeout BEFORE it has charged,
         it marks the order cancelled and skips / aborts the charge instead.
         Either way the invariant holds: a cancelled order never keeps money.
       '
