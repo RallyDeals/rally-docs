@@ -226,9 +226,9 @@ therefore skips anything already parked.
 | `Order.created` | Notification Service | Send confirmation email |
 | `Order.authorized` | Notification Service | Push: "You are in — pending deal outcome" — Notification is this event's **only** subscriber; Deal Service's `authorized_count++` happens via the sync `authorize-slot` RPC, not by consuming this event (see correction below) |
 | `Order.normal_order_cancelled` | Inventory Service | Release stock using the `items` list in the payload |
-| `Order.normal_order_cancelled` | Participation Service | Convert status to `removed` |
 | `Order.normal_order_cancelled` | Notification Service | Send email |
 | `Order.deal_order_cancelled` | Notification Service | Push notify buyer of the outcome |
+| `Order.deal_order_cancelled` | Participation Service | Convert status to `removed` |
 | `order.payment_charge_required` | Payment Service | Charge the amount using paymentIntentId |
 | `order.payment_authorize_required` | Payment Service | Authorize the amount using paymentIntentId |
 | `order.payment_capture_required` | Payment Service | Capture the held amount |
