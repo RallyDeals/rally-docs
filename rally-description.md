@@ -46,7 +46,7 @@ how the race between the two resolution triggers is handled.
 | 4 | **Deal Service** ⭐ | Deal lifecycle, pricing, capacity, timer bookkeeping (merged former Scheduler Service), single source of truth for deal state | Postgres |
 | 5 | **Participation Service** | Join/leave, referral links, high-write participant tracking | Postgres |
 | 6 | **Inventory Service** | Product-level stock reservation for deals | Postgres |
-| 7 | **Order Service** | Owns all orders (deal + normal); only service that calls Payment Service | Postgres |
+| 7 | **Order Service** | Owns all orders (deal + normal); the only service whose payment needs Payment Service acts on — relationship is purely event-driven (Kafka), no synchronous calls either direction | Postgres |
 | 8 | **Payment Service** | Stripe (test mode) integration: authorize / capture / void | Postgres |
 | 9 | **Notification Service** | Kafka consumer → WebSocket/email push | Postgres (or stateless) |
 
@@ -158,7 +158,7 @@ is validated against — and reserves from — this at deal-creation time.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| POST | `/orders` | Normal checkout: buyer's cart → order + line items, authorize + capture immediately |
+| POST | `/orders` | Normal checkout: buyer's cart → order + line items. Order Service fires `order.payment_charge_required` and waits briefly, in-request, for its own consumer to observe the resulting `payment.charged`/`payment.failed`; if that resolves in time the response is `201`/`402`, otherwise `202` with the order left `pending_charge` (resolved later via the async path) |
 | GET | `/orders/{id}` | Order status (with line items) |
 | GET | `/users/{id}/orders` | User's order history |
 
@@ -167,7 +167,7 @@ order_products(id, order_id, product_id, quantity, unit_price, created_at)`
 
 **Communication:**
 - Async (subscribes): `participant.joined`, `participant.left`, `payment.failed`, `payment.authorized`, `payment.captured`, `payment.charged`,`payment.voided`, `deal.succeeded`, `deal.failed`
-- Async (publishes): `order.created`, `order.normal_order_cancelled`, `order.deal_order_cancelled`, `order.payment_initiation_requested` (type=CHARGE/AUTHORIZE — new charge/hold, carries `user_id` + `amount` + `payment_intent_id`), `order.payment_settlement_requested` (type=CAPTURE/VOID — acts on an existing `payment_id`), `order.authorized`
+- Async (publishes): `order.created`, `order.normal_order_cancelled`, `order.deal_order_cancelled`, `order.payment_charge_required` (NORMAL charge, carries `user_id` + `order_id` + `amount` + `payment_intent_id`, `idempotencyKey = order_id`), `order.payment_authorize_required` (DEAL hold, same payload shape), `order.payment_capture_required` (`{payment_id, idempotencyKey = payment_id}`), `order.payment_void_required` (`{payment_id, idempotencyKey = payment_id}`), `Order.payment_timeout` (`{order_id, idempotencyKey = order_id}` — sweep-fired when an order sits in `pending_charge`/`pending_authorization` past its staleness threshold with no payment outcome; tells Payment Service to force-resolve/cancel the stuck intent), `order.authorized`
 
 ### 4.8 Payment Service
 
@@ -189,7 +189,7 @@ Maps onto Stripe's PaymentIntents API with manual capture:
 **DB:** `payments(id, order_id, amount, status, payment_intent_id, idempotency_key, created_at)` — `status`: `authorized` / `captured` / `charged` / `voided`; `payment_intent_id` (Stripe "pi_...") is echoed back in every `payment.*` event payload
 
 **Communication:**
-- Async (subscribes): `order.payment_initiation_requested` (create + confirm the PaymentIntent — CHARGE or AUTHORIZE), `order.payment_settlement_requested` (capture/void the existing PaymentIntent by `payment_id`), `order.normal_order_cancelled` / `order.deal_order_cancelled` (safety net: void any PaymentIntent that exists for a cancelled order).
+- Async (subscribes): `order.payment_charge_required` (create + confirm a PaymentIntent, `capture_method: automatic` — NORMAL), `order.payment_authorize_required` (create + confirm a PaymentIntent, `capture_method: manual` — DEAL hold), `order.payment_capture_required` (capture the existing PaymentIntent by `payment_id`), `order.payment_void_required` (cancel the existing PaymentIntent by `payment_id`), `Order.payment_timeout` (force-resolve/cancel a PaymentIntent stuck past its staleness threshold with no outcome yet — sweep-fired by Order Service, see Section 4.7). Order Service's `order.normal_order_cancelled`/`order.deal_order_cancelled` are **not** subscribed here — voiding a cancelled order's payment goes exclusively through `order.payment_void_required`, not a separate safety net off the cancellation events.
 - Async (publishes): `payment.authorized`, `payment.charged`, `payment.captured`, `payment.voided`, `payment.failed` (real Stripe decline, e.g. via Stripe's test decline card numbers — consumed by Order Service to trigger its compensation, see Section 4.7) — every `payment.*` payload includes `payment_intent_id`
 
 ### 4.9 Notification Service
