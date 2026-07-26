@@ -464,8 +464,8 @@ views {
     kafka -> orderService 'payment.voided'
 
     orderService -> orderService 'UPDATE status = cancelled, cancel_reason = participant_left  WHERE status = pending_void  (guard)'
-    orderService -> dealService 'release-slot  (sync, guarded WHERE status = active)' {
-      notes 'Also decrements authorized_count, since this participant had a hold placed - mirrors reserve-slot at join'
+    orderService -> dealService 'release-authorized-slot  (sync, guarded WHERE status = active)' {
+      notes 'Distinct endpoint from release-slot - this order had reached authorized (hold was placed), so both counters must be undone atomically'
     }
     dealService -> orderService 'released OK  (reserved_stock--, authorized_count--)'
 

@@ -232,7 +232,8 @@ is a no-op, never an error).
 ```
 
 **Sweep behavior differs by stage** (per the Deal Join 6/7 sweep notes): orders stuck in
-`pending_authorization` > 60s are **force-cancelled** (silence = failure, slot released);
+`pending_authorization` > 60s are **force-cancelled** (silence = failure; `release-slot`
+called — `reserved_stock--` only, since the order never reached `authorized`);
 orders stuck in `pending_capture` or `pending_void` > 60s are instead **re-published** —
 the same `order.payment_settlement_requested` (type=CAPTURE/VOID, idempotencyKey=payment_id) is fired
 again, never a cancel, because capture/void against an existing `payment_id` is idempotent
@@ -297,7 +298,7 @@ therefore skips anything already parked.
 | `Order.normal_order_cancelled` | Inventory Service | Release stock using the `items` list in the payload |
 | `Order.normal_order_cancelled` | Notification Service | Send email |
 | `Order.deal_order_cancelled` | Notification Service | Push notify buyer of the outcome |
-| `Order.deal_order_cancelled` | Participation Service | Convert status to `removed` |
+| `Order.deal_order_cancelled` | Participation Service | Convert status to `removed` — only for `payment_declined`/`payment_timeout` reasons; on `participant_left` the row was already flipped synchronously when the leave request was made, so this is a no-op there |
 | `order.payment_charge_required` | Payment Service | Charge the amount using paymentIntentId |
 | `order.payment_authorize_required` | Payment Service | Authorize the amount using paymentIntentId |
 | `order.payment_capture_required` | Payment Service | Capture the held amount |
@@ -310,11 +311,11 @@ therefore skips anything already parked.
 
 | Event | Payload | Order Service does |
 |---|---|---|
-| `Payment.failed` | `(payment_id, payment_intent_id, order_id, amount, error)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status IN (pending_charge, pending_authorization)` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. Fire `Order.normal_order_cancelled` (NORMAL) or `Order.deal_order_cancelled` (DEAL) |
+| `Payment.failed` | `(payment_id, payment_intent_id, order_id, amount, error)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status IN (pending_charge, pending_authorization)` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. On the DEAL path only: call `release-slot` on Deal Service (sync — `reserved_stock--`; the order never reached `authorized`, so `authorized_count` is untouched)<br>5. Fire `Order.normal_order_cancelled` (NORMAL) or `Order.deal_order_cancelled` (DEAL) |
 | `Payment.charged` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_charge` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. Fire `Order.created` |
 | `Payment.authorized` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = authorized WHERE status = pending_authorization` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. Call `authorize-slot` on Deal Service (sync — `authorized_count++`, deal may flip `succeeded` here)<br>5. Fire `Order.authorized` |
 | `Payment.captured` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_capture` (guard)<br>3. Set `payment_id` + `payment_intent_id` on the order<br>4. Fire `Order.created` |
-| `Payment.voided` | `(order_id, payment_id, payment_intent_id, amount)` | *(not in your list, but present in every void path)* 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard) with `cancel_reason` = `deal_failed` or `participant_left` depending on which path parked the order in `pending_void`<br>3. On the leave path only: call `release-slot` on Deal Service (sync — `reserved_stock--`, `authorized_count--`)<br>4. Fire `Order.deal_order_cancelled` |
+| `Payment.voided` | `(order_id, payment_id, payment_intent_id, amount)` | *(not in your list, but present in every void path)* 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard) with `cancel_reason` = `deal_failed` or `participant_left` depending on which path parked the order in `pending_void`<br>3. On the leave path only: call `release-authorized-slot` on Deal Service (sync — `reserved_stock--` and `authorized_count--`, atomically; the order had reached `authorized` before parking, unlike the plain `release-slot` case)<br>4. Fire `Order.deal_order_cancelled` |
 | `Participant.joined` | `(participant_id, deal_id, user_id, product_id, price, payment_intent_id)` | 1. Create order row, `status = pending_authorization`, `payment_intent_id` from the event (+ `order_products` row)<br>2. Fire `Order.payment_initiation_requested(user_id, order_id, amount, 'AUTHORIZE', payment_intent_id)` |
 | `Participant.left` | `(participant_id, deal_id)` | 1. Find the **existing** order `WHERE deal_id = ? AND participant_id = ? AND status = authorized` — no new row is created<br>2. `UPDATE status = pending_void WHERE status = authorized` (guard — parks the order so deal-resolution batches skip it)<br>3. Fire `Order.payment_settlement_requested(payment_id, 'VOID')` |
 | `Deal.succeeded` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: `SELECT ... WHERE deal_id = ? AND status = authorized FOR UPDATE SKIP LOCKED` → `status = pending_capture`<br>2. Fire `Order.payment_settlement_requested(payment_id, 'CAPTURE')` per order |
