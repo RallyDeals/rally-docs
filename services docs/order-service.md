@@ -298,7 +298,7 @@ therefore skips anything already parked.
 | `Order.normal_order_cancelled` | Inventory Service | Release stock using the `items` list in the payload |
 | `Order.normal_order_cancelled` | Notification Service | Send email |
 | `Order.deal_order_cancelled` | Notification Service | Push notify buyer of the outcome |
-| `Order.deal_order_cancelled` | Participation Service | Convert status to `removed` |
+| `Order.deal_order_cancelled` | Participation Service | Convert status to `removed` — only for `payment_declined`/`payment_timeout` reasons; on `participant_left` the row was already flipped synchronously when the leave request was made, so this is a no-op there |
 | `order.payment_charge_required` | Payment Service | Charge the amount using paymentIntentId |
 | `order.payment_authorize_required` | Payment Service | Authorize the amount using paymentIntentId |
 | `order.payment_capture_required` | Payment Service | Capture the held amount |

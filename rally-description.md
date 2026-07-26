@@ -131,8 +131,12 @@ recording a join, `check-leave-eligible` (time-window only, no capacity change) 
 recording a leave. It never calls `release-slot` / `release-authorized-slot` itself —
 knowing whether a participant's order ever reached an authorized payment hold is state
 Order Service owns, and capacity can only be safely released once Order Service has
-resolved (voided) that hold. Participation Service's own row is instead flipped to
-`removed` asynchronously, in reaction to `order.deal_order_cancelled`.
+resolved (voided) that hold. Its own row, though, is flipped to `removed` **synchronously**
+on a leave request — right after `check-leave-eligible` succeeds, before the async
+void/release chain even starts, since the buyer initiated this themselves and shouldn't
+wait on it. For every other termination path it did **not** initiate (payment declined at
+join, payment/authorization timeout), it depends on `order.deal_order_cancelled` to learn
+the outcome and flips the row only then.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -146,9 +150,13 @@ resolved (voided) that hold. Participation Service's own row is instead flipped 
 **DB:** `participations(id, deal_id, user_id, referred_by, joined_at, status)` — `status`: `active` / `left`
 
 **Communication:**
-- Sync: calls Deal Service's `reserve-slot` on join, `check-leave-eligible` on leave.
+- Sync: calls Deal Service's `reserve-slot` on join, `check-leave-eligible` on leave (row
+  flipped to `removed` synchronously in this same request).
 - Async (publishes): `participant.joined`, `participant.left`
-- Async (subscribes): `order.deal_order_cancelled` (flip participation row to `removed`)
+- Async (subscribes): `order.deal_order_cancelled` — only for the paths it didn't initiate
+  itself (payment declined, payment/authorization timeout); flips participation row to
+  `removed` there. The leave path already flipped synchronously and does not act on this
+  event.
 
 ### 4.6 Inventory Service
 Product-level stock, separate from a deal's own `stock`/`reserved_stock` cap. A deal's cap
