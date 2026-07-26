@@ -221,7 +221,7 @@ Maps onto Stripe's PaymentIntents API with manual capture:
 
 ---
 
-## 6. NORMAL ORDER flow
+## 5. NORMAL ORDER flow
 
 ```
  (start)
@@ -252,7 +252,7 @@ Maps onto Stripe's PaymentIntents API with manual capture:
                                                              > 5 min)
 ```
 
-## 7. DEAL ORDER flow
+## 6. DEAL ORDER flow
 
 ```
  (start)
