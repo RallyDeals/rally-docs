@@ -91,8 +91,11 @@ deal's status directly.
 | GET | `/deals` | Browse deals |
 | GET | `/deals/{id}` | Deal detail + current status + live count |
 | POST | `/deals/{id}/cancel` | Seller cancels — only allowed pre-first-join |
-| POST | `/deals/{id}/reserve-slot` | **Internal, sync.** Called by Participation Service on join. Atomically reserves one slot if capacity allows. |
-| POST | `/deals/{id}/release-slot` | **Internal, sync.** Called by Participation Service on leave, and by Order Service if a payment authorization fails. |
+| POST | `/deals/{id}/reserve-slot` | **Internal, sync.** Called by Participation Service on join. Atomically reserves one slot if capacity allows: `reserved_stock++`. |
+| POST | `/deals/{id}/check-leave-eligible` | **Internal, sync.** Called by Participation Service on leave. Read-only gate — `status IN (active, pending) AND now() < end_time - 10min` — does not touch capacity. |
+| POST | `/deals/{id}/authorize-slot` | **Internal, sync.** Called by Order Service when a payment is authorized: `authorized_count++` — deal may flip to `succeeded` here if this fills `min_participants`/`stock`. |
+| POST | `/deals/{id}/release-slot` | **Internal, sync.** Called by Order Service when an order is cancelled without ever reaching `authorized` (payment declined, timed out, or force-cancelled by the sweep). Undoes `reserve-slot`: `reserved_stock--`. |
+| POST | `/deals/{id}/release-authorized-slot` | **Internal, sync.** Called by Order Service when an order had already reached `authorized` before being cancelled (participant left after a hold was placed). Undoes both `reserve-slot` and `authorize-slot`, atomically: `reserved_stock--` and `authorized_count--`. |
 
 **DB:** `deals(id, product_id, seller_id, discount_price, stock, reserved_stock, min_participants,
   status, start_time, duration_minutes, end_time, created_at)`
@@ -103,7 +106,7 @@ the resolution:
 - **Stock fills up before the timer expires** → always `succeeded`. This is guaranteed by
   the creation-time constraint `min_participants <= stock`: if `reserved_stock` reaches
   `stock`, it has necessarily already reached (or passed) `min_participants`.
-- **Timer expires before stock fills** → `succeeded` if `reserved_stock >= min_participants`
+- **Timer expires before stock fills** → `succeeded` if `authorized_count >= min_participants`
   at that instant, otherwise `failed`.
 
 So both triggers ultimately check the same thing; the stock-fill case just happens to always
@@ -116,14 +119,20 @@ evaluate true by construction.
 filling the stock cap without any cross-service coordination.
 
 **Communication:**
-- Sync: exposes `reserve-slot` / `release-slot` to Participation Service
+- Sync: exposes `reserve-slot` / `check-leave-eligible` to Participation Service; exposes
+  `authorize-slot` / `release-slot` / `release-authorized-slot` to Order Service
 - Async (publishes): `deal.created`, `deal.cancelled`, `deal.succeeded`, `deal.failed`
 - Async (subscribes): none.
 
 ### 4.5 Participation Service
 High-write service. Tracks who joined which deal and referral relationships. Does **not**
-own capacity — always defers to Deal Service's `reserve-slot` / `release-slot` before
-recording anything.
+own capacity — it defers every capacity decision to Deal Service: `reserve-slot` before
+recording a join, `check-leave-eligible` (time-window only, no capacity change) before
+recording a leave. It never calls `release-slot` / `release-authorized-slot` itself —
+knowing whether a participant's order ever reached an authorized payment hold is state
+Order Service owns, and capacity can only be safely released once Order Service has
+resolved (voided) that hold. Participation Service's own row is instead flipped to
+`removed` asynchronously, in reaction to `order.deal_order_cancelled`.
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -137,8 +146,9 @@ recording anything.
 **DB:** `participations(id, deal_id, user_id, referred_by, joined_at, status)` — `status`: `active` / `left`
 
 **Communication:**
-- Sync: calls Deal Service's `reserve-slot`/`release-slot` before writing a participation row.
+- Sync: calls Deal Service's `reserve-slot` on join, `check-leave-eligible` on leave.
 - Async (publishes): `participant.joined`, `participant.left`
+- Async (subscribes): `order.deal_order_cancelled` (flip participation row to `removed`)
 
 ### 4.6 Inventory Service
 Product-level stock, separate from a deal's own `stock`/`reserved_stock` cap. A deal's cap
