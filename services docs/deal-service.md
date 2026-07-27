@@ -321,8 +321,8 @@ response reflects `succeeded` — the same transaction that increments the count
 resolves the deal, mirroring how reserve-slot already handles the `pending→active`
 transition atomically.
 
-Rejected response (**SHOULD NOT HAPPEN - بس خليها اما نشوف** — a slot reaching authorization implies it was already
-reserved, but the deal could have been cancelled/resolved in between by the sweep):
+Rejected response (**ٍshould be rare** — a slot reaching authorization implies it was already
+reserved, but the deal could have been resolved in between by the sweep):
 ```json
 { "success": false, "dealId": "9e1c4b7a-...", "reason": "DEAL_NOT_JOINABLE" }
 ```
