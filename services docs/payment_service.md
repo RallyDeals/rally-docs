@@ -12,8 +12,7 @@ It focuses on the broker-driven payment flow:
 
 The selected integration model is:
 
-- `order.payment_initiation_requested` for the first step.
-- `order.payment_settlement_requested` for the second step.
+- `order.payments_requested` for the first step.
 
 The payment service does not need to be called directly by Order over HTTP for the main checkout flow.
 
@@ -281,19 +280,14 @@ Recommended `X-Type` values for outcome messages:
 
 | Topic | Purpose | `X-Type` selector |
 |---|---|---|
-| `order.payment_initiation_requested` | First step of checkout | `X-Type = Payment.InitRequired.Charge` or `Payment.InitRequired.Authorize` |
-| `order.payment_settlement_requested` | Final settlement step | `X-Type = Payment.SettlementRequired.Capture` or `Payment.SettlementRequired.Void` |
+| `order.payments_requested` | First step of checkout | `X-Type = Payment.InitRequired.Charge` or `Payment.InitRequired.Authorize` |
+| `order.payments_requested` | Final settlement step | `X-Type = Payment.SettlementRequired.Capture` or `Payment.SettlementRequired.Void` |
 
 ### 4.3 Payment Service -> Order Service
 
 | Topic | Purpose |
 |---|---|
-| `payment.authorized` | Payment has been authorized |
-| `payment.charged` | Immediate purchase has succeeded |
-| `payment.captured` | Previously authorized payment has been captured |
-| `payment.failed` | Payment failed |
-| `payment.voided` | Authorized payment was voided |
-| `payment.requires_action` | Customer action is required |
+| `payment.events` | Payment outcome events consumed by Order Service |
 
 ---
 
@@ -557,7 +551,7 @@ sequenceDiagram
     participant S as Stripe
     participant X as Outbox
 
-    O->>P: order.payment_initiation_requested [X-Type=Payment.InitRequired.Charge]
+    O->>P: order.payments_requested [X-Type=Payment.InitRequired.Charge]
     P->>P: save inbox message
     P->>S: create and confirm PaymentIntent
     S-->>P: succeeded or failed
@@ -569,7 +563,7 @@ sequenceDiagram
 
 Typical sequence:
 
-1. Order Service creates the order and publishes `order.payment_initiation_requested` with `X-Type=Payment.InitRequired.Charge`.
+1. Order Service creates the order and publishes `order.payments_requested` with `X-Type=Payment.InitRequired.Charge`.
 2. Payment Service stores the message in the inbox table.
 3. Payment Service loads the payment method and creates the Stripe PaymentIntent.
 4. If Stripe confirms the payment, Payment Service marks the payment as `CHARGED`.
@@ -591,7 +585,7 @@ sequenceDiagram
     participant S as Stripe
     participant X as Outbox
 
-    O->>P: order.payment_initiation_requested [X-Type=Payment.InitRequired.Authorize]
+    O->>P: order.payments_requested [X-Type=Payment.InitRequired.Authorize]
     P->>P: save inbox message
     P->>S: create manual-capture PaymentIntent
     S-->>P: authorized or failed
@@ -603,7 +597,7 @@ sequenceDiagram
 Typical sequence:
 
 1. Order Service creates a deal order in pending authorization state.
-2. It publishes `order.payment_initiation_requested` with `X-Type=Payment.InitRequired.Authorize`.
+2. It publishes `order.payments_requested` with `X-Type=Payment.InitRequired.Authorize`.
 3. Payment Service authorizes the amount with Stripe.
 4. Payment Service publishes `payment.authorized`.
 5. Order Service moves the order to `AUTHORIZED`.
@@ -617,7 +611,7 @@ sequenceDiagram
     participant S as Stripe
     participant X as Outbox
 
-    O->>P: order.payment_settlement_requested [X-Type=Payment.SettlementRequired.Capture]
+    O->>P: order.payments_requested [X-Type=Payment.SettlementRequired.Capture]
     P->>P: save inbox message
     P->>S: capture PaymentIntent
     S-->>P: succeeded or failed
@@ -628,7 +622,7 @@ sequenceDiagram
 
 For void:
 
-1. Order Service publishes `order.payment_settlement_requested` with `X-Type=Payment.SettlementRequired.Void`.
+1. Order Service publishes `order.payments_requested` with `X-Type=Payment.SettlementRequired.Void`.
 2. Payment Service cancels the authorized intent.
 3. Payment Service publishes `payment.voided`.
 4. Order Service cancels the order.
@@ -750,8 +744,7 @@ The payment service does not own:
 
 For Rally, keep the contract names aligned with Order Service:
 
-- `order.payment_initiation_requested`
-- `order.payment_settlement_requested`
+- `order.payments_requested`
 - `payment.authorized`
 - `payment.charged`
 - `payment.captured`
