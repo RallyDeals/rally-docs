@@ -257,7 +257,9 @@ Every brokered message, whether consumed or published, must include these header
 
 The payload must not contain any of those fields.
 
-For payment requests, the operation must be selected by `X-Type`, not by a payload field.
+For payment requests and payment outcome events, the operation or message type must be selected by `X-Type`, not by a payload field.
+
+The payload must never carry `status` or any enum value in either inbound or outbound messages.
 
 Recommended `X-Type` values for request messages:
 
@@ -322,6 +324,8 @@ Payload:
 }
 ```
 
+This payload intentionally contains no `status` or enum field.
+
 Interpretation:
 
 - `X-Type = Payment.InitRequired.Charge` for normal purchase
@@ -350,6 +354,8 @@ Payload:
 }
 ```
 
+This payload intentionally contains no `status` or enum field.
+
 Interpretation:
 
 - `X-Type = Payment.SettlementRequired.Capture`
@@ -377,9 +383,10 @@ Payload:
   "orderId": "uuid",
   "paymentIntentId": "pi_...",
   "amount": 125.50,
-  "status": "AUTHORIZED"
 }
 ```
+
+`X-Type` declares the message type; the payload does not carry a `status` or enum.
 
 #### `payment.charged`
 
@@ -401,9 +408,10 @@ Payload:
   "orderId": "uuid",
   "paymentIntentId": "pi_...",
   "amount": 125.50,
-  "status": "CHARGED"
 }
 ```
+
+`X-Type` declares the message type; the payload does not carry a `status` or enum.
 
 #### `payment.captured`
 
@@ -425,9 +433,10 @@ Payload:
   "orderId": "uuid",
   "paymentIntentId": "pi_...",
   "amount": 125.50,
-  "status": "CAPTURED"
 }
 ```
+
+`X-Type` declares the message type; the payload does not carry a `status` or enum.
 
 #### `payment.failed`
 
@@ -474,9 +483,10 @@ Payload:
   "orderId": "uuid",
   "paymentIntentId": "pi_...",
   "amount": 125.50,
-  "status": "VOIDED"
 }
 ```
+
+`X-Type` declares the message type; the payload does not carry a `status` or enum.
 
 #### `payment.requires_action`
 
@@ -498,9 +508,10 @@ Payload:
   "orderId": "uuid",
   "paymentIntentId": "pi_...",
   "amount": 125.50,
-  "status": "REQUIRES_ACTION"
 }
 ```
+
+`X-Type` declares the message type; the payload does not carry a `status` or enum.
 
 ### 5.4 Required Headers
 
