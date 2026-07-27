@@ -742,17 +742,30 @@ The payment service does not own:
 
 ## 9. Notes on Naming
 
-For Rally, keep the contract names aligned with Order Service:
+For Rally, keep the contract names aligned with Order Service.
+
+### Topic Names
 
 - `order.payments_requested`
-- `payment.authorized`
-- `payment.charged`
-- `payment.captured`
-- `payment.failed`
-- `payment.voided`
-- `payment.requires_action`
+- `payment.events`
 
-Avoid mixing uppercase command names and lowercase event names in the broker contract itself. Keep uppercase only for enum values in code, not for topic names.
+### Inbound Message `X-Type` Values
+
+- `Payment.InitRequired.Charge`
+- `Payment.InitRequired.Authorize`
+- `Payment.SettlementRequired.Capture`
+- `Payment.SettlementRequired.Void`
+
+### Outbound Message `X-Type` Values
+
+- `Payment.Authorized`
+- `Payment.Charged`
+- `Payment.Captured`
+- `Payment.Failed`
+- `Payment.Voided`
+- `Payment.RequiresAction`
+
+Keep topic names lowercase and domain-oriented. Keep `X-Type` values as the message contract identifiers, and keep enum casing only in code-level models where needed.
 
 ---
 
