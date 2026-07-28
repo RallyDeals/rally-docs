@@ -1,0 +1,202 @@
+erDiagram
+    %% ---------------- USER SERVICE ----------------
+    USER {
+        UUID id PK
+        string username
+        string firstName
+        string lastName
+        string email
+        string password
+        string phoneNumber
+        string profilePicture
+        date birthDate
+        string gender
+        string stripeCustomerId
+        boolean enabled
+        datetime createdAt
+        datetime updatedAt
+    }
+
+    TOKEN {
+        UUID id PK
+        string token
+        datetime expirationDate
+        datetime revocationDate
+        UUID user_id FK
+        datetime createdAt
+        datetime updatedAt
+    }
+
+    USER ||--o{ TOKEN : "user_id"
+
+    %% ---------------- CATALOG SERVICE ----------------
+    CATEGORIES {
+        uuid id PK
+        varchar name
+        text description
+        timestamptz created_at
+    }
+
+    PRODUCTS {
+        uuid id PK
+        uuid seller_id "ref: User Service (no FK)"
+        varchar name
+        text description
+        uuid category_id FK
+        numeric base_price
+        varchar image_url
+        varchar status "PENDING_APPROVAL / APPROVED / REJECTED"
+        text rejection_reason
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz deleted_at "soft-delete"
+    }
+
+    PARTICIPATIONS {
+        uuid id PK
+        uuid deal_id "ref: Deal Service (no FK)"
+        uuid user_id "ref: User Service (no FK)"
+        uuid referred_by "ref: user_id, nullable"
+        varchar status "ACTIVE / LEFT"
+        timestamptz joined_at
+        timestamptz left_at
+    }
+
+    REFERRAL_LINKS {
+        varchar code PK
+        uuid deal_id "ref: Deal Service (no FK)"
+        uuid referrer_user_id "ref: User Service (no FK)"
+        timestamptz created_at
+        timestamptz expires_at
+    }
+
+    CATEGORIES ||--o{ PRODUCTS : "category_id"
+
+    %% ---------------- PAYMENT SERVICE ----------------
+    PAYMENT_METHODS {
+        uuid id PK
+        uuid user_id "ref: User Service (no FK)"
+        varchar type
+        varchar token
+        boolean is_default
+        varchar card_brand
+        varchar card_last4
+        varchar card_exp_month
+        varchar card_exp_year
+        bigint version
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    PAYMENTS {
+        uuid id PK
+        uuid user_id "ref: User Service (no FK)"
+        uuid order_id "ref: Order Service (no FK)"
+        uuid payment_method_id FK
+        varchar payment_intent_id
+        varchar stripe_customer_id
+        numeric amount
+        varchar status
+        varchar failure_reason
+        timestamptz created_at
+        timestamptz authorized_at
+        timestamptz captured_at
+        timestamptz charged_at
+        timestamptz failed_at
+        timestamptz voided_at
+        timestamptz updated_at
+        bigint version
+    }
+
+    PAYMENT_METHODS ||--o{ PAYMENTS : "payment_method_id"
+
+    %% ---------------- ORDER SERVICE ----------------
+    ORDERS {
+        uuid id PK
+        uuid user_id "ref: User Service (no FK)"
+        varchar order_type "NORMAL / DEAL"
+        uuid deal_id "ref: Deal Service (no FK), required if DEAL"
+        uuid participant_id "required if DEAL"
+        varchar status
+        numeric total_price
+        uuid payment_id "ref: Payment Service (no FK)"
+        varchar payment_intent_id "denormalized from Payment Service"
+        varchar cancel_reason
+        int version
+        timestamptz created_at
+        timestamptz updated_at
+        timestamptz status_updated_at
+    }
+
+    ORDER_PRODUCTS {
+        uuid id PK
+        uuid order_id FK
+        uuid product_id "ref: Catalog Service (no FK)"
+        int quantity
+        numeric unit_price "price snapshot at order time"
+        timestamptz created_at
+    }
+
+    ORDERS ||--o{ ORDER_PRODUCTS : "order_id"
+
+    %% ---------------- INVENTORY SERVICE ----------------
+    INVENTORY {
+        uuid product_id PK "shared identity: Catalog Service"
+        int total_stock
+        int reserved_stock
+        int available_stock "derived: total - reserved (unenforced)"
+        timestamptz updated_at
+        bigint version
+    }
+
+    INVENTORY_HISTORY {
+        uuid history_id PK
+        uuid product_id FK
+        int quantity_change
+        varchar movement_type
+        uuid reference_id "ref: e.g. Order Service (no FK, no type discriminator)"
+        timestamptz created_at
+    }
+
+    INVENTORY ||--o{ INVENTORY_HISTORY : "product_id"
+
+    %% ---------------- DEAL SERVICE ----------------
+    DEALS {
+        uuid id PK
+        uuid product_id "ref: Catalog Service (no FK)"
+        uuid seller_id "ref: User Service (no FK)"
+        numeric original_price "snapshot of product.base_price at creation"
+        numeric deal_price "absolute price paid on success, not a discount"
+        int deal_stock "deal-level cap, distinct from Inventory stock"
+        int current_participants "joined intending to buy (FR-051)"
+        int authorized_count "payment-verified joins; drives success/failure"
+        int min_participants
+        varchar status "pending / active / succeeded / failed / cancelled"
+        timestamptz start_time "set on first successful reserve-slot"
+        int duration_minutes
+        timestamptz end_time "derived: start_time + duration_minutes (unenforced)"
+        int version
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    %% ---------------- CROSS-SERVICE (REFERENCE-ONLY, NO FK) RELATIONS ----------------
+    DEALS }o..|| PRODUCTS : "product_id (ref only)"
+    PARTICIPATIONS }o..|| DEALS : "deal_id (ref only)"
+    REFERRAL_LINKS }o..|| DEALS : "deal_id (ref only)"
+    ORDERS }o..|| DEALS : "deal_id (ref only, if DEAL)"
+    ORDERS }o..|| PARTICIPATIONS : "participant_id (ref only)"
+    ORDER_PRODUCTS }o..|| PRODUCTS : "product_id (ref only)"
+    INVENTORY ||..|| PRODUCTS : "product_id (shared identity, ref only)"
+    PAYMENTS }o..|| ORDERS : "order_id (ref only)"
+    ORDERS }o..|| PAYMENTS : "payment_id (ref only)"
+
+    %% ---------------- USER-CENTRIC CROSS-SERVICE RELATIONS ----------------
+    USER ||..o{ PRODUCTS : "seller_id (ref only)"
+    USER ||..o{ DEALS : "seller_id (ref only)"
+    USER ||..o{ PARTICIPATIONS : "user_id (ref only)"
+    USER ||..o{ PARTICIPATIONS : "referred_by (ref only)"
+    USER ||..o{ REFERRAL_LINKS : "referrer_user_id (ref only)"
+    USER ||..o{ PAYMENT_METHODS : "user_id (ref only)"
+    USER ||..o{ PAYMENTS : "user_id (ref only)"
+    USER ||..o{ ORDERS : "user_id (ref only)"
