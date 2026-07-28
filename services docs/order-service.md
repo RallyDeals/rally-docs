@@ -130,6 +130,8 @@ CREATE TABLE outbox_events (
     attempts        INT NOT NULL DEFAULT 0,    -- added V3
     last_error      TEXT,                      -- added V3
     correlation_id  UUID NOT NULL              -- added V6
+    causation_id UUID NOT NULL,                -- added V8
+    trace_id UUID NOT NULL                     -- added V8
 );
 
 
