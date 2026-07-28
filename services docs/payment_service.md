@@ -266,6 +266,7 @@ Recommended `X-Type` values for request messages:
 - `Payment.InitRequired.Authorize`
 - `Payment.SettlementRequired.Capture`
 - `Payment.SettlementRequired.Void`
+- `Payment.Timeout`
 
 Recommended `X-Type` values for outcome messages:
 
@@ -282,6 +283,7 @@ Recommended `X-Type` values for outcome messages:
 |---|---|---|
 | `order.payments_requested` | First step of checkout | `X-Type = Payment.InitRequired.Charge` or `Payment.InitRequired.Authorize` |
 | `order.payments_requested` | Final settlement step | `X-Type = Payment.SettlementRequired.Capture` or `Payment.SettlementRequired.Void` |
+| `order.payments_requested` | Order timed out and payment must be cancelled | `X-Type = Payment.Timeout` |
 
 ### 4.3 Payment Service -> Order Service
 
@@ -355,7 +357,35 @@ Interpretation:
 - `X-Type = Payment.SettlementRequired.Capture`
 - `X-Type = Payment.SettlementRequired.Void`
 
-### 5.3 Payment Outcome Events
+### 5.3 Payment Timeout Received
+
+The order service sends this when the order has timed out and the payment service must cancel the payment for that order.
+
+Headers:
+
+| Header | Example |
+|---|---|
+| `X-Type` | `Payment.Timeout` |
+| `X-Id` | `uuid` |
+| `X-Correlation-Id` | `uuid` |
+| `X-Causation-Id` | `uuid` of the order event that triggered the timeout |
+| `X-Trace-Id` | tracing id |
+
+Payload:
+
+```json
+{
+  "orderId": "uuid"
+}
+```
+
+This payload intentionally contains no `status` or enum field.
+
+Interpretation:
+
+- `X-Type = Payment.Timeout` means the payment service must cancel the payment / Stripe PaymentIntent for the specified `orderId`.
+
+### 5.4 Payment Outcome Events
 
 #### `payment.authorized`
 
@@ -507,7 +537,7 @@ Payload:
 
 `X-Type` declares the message type; the payload does not carry a `status` or enum.
 
-### 5.4 Required Headers
+### 5.5 Required Headers
 
 | Header | Purpose |
 |---|---|
@@ -627,7 +657,32 @@ For void:
 3. Payment Service publishes `payment.voided`.
 4. Order Service cancels the order.
 
-### 6.4 Inbox Reliability
+### 6.4 Payment Timeout Flow
+
+```mermaid
+sequenceDiagram
+    participant O as Order Service
+    participant P as Payment Service
+    participant S as Stripe
+    participant X as Outbox
+
+    O->>P: order.payments_requested [X-Type=Payment.Timeout]
+    P->>P: save inbox message
+    P->>S: cancel PaymentIntent (if active)
+    S-->>P: cancelled
+    P->>P: update Payment status to FAILED/VOIDED
+    P->>X: write payment.voided or payment.failed (if outcome event needed)
+```
+
+Typical sequence:
+
+1. Order Service's reconciliation sweeper identifies an order stuck in `pending_charge` (> 5 min) or `pending_authorization` (> 60s).
+2. Order Service publishes an event to `order.payments_requested` with header `X-Type = Payment.Timeout` and payload `{ "orderId": "uuid" }`.
+3. Payment Service receives the message and persists it in `inbox_messages` for deduplication.
+4. Payment Service looks up the payment for `orderId`. If a Stripe PaymentIntent exists and is active, Payment Service cancels it with Stripe.
+5. Payment Service updates the local payment status to `VOIDED` or `FAILED`.
+
+### 6.5 Inbox Reliability
 
 ```mermaid
 flowchart LR
@@ -647,7 +702,7 @@ Rules:
 - Payment state changes and outbox writes happen in the same transaction.
 - Inbox and outbox entries must preserve the header envelope fields.
 
-### 6.5 Outbox Relay
+### 6.6 Outbox Relay
 
 ```mermaid
 flowchart LR
@@ -755,6 +810,8 @@ For Rally, keep the contract names aligned with Order Service.
 - `Payment.InitRequired.Authorize`
 - `Payment.SettlementRequired.Capture`
 - `Payment.SettlementRequired.Void`
+- `Payment.Timeout`
+
 
 ### Outbound Message `X-Type` Values
 
