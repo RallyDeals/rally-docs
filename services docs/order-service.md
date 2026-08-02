@@ -96,10 +96,10 @@ and a late payment event mutually exclusive: whichever commits first wins, the o
 stateDiagram-v2
     [*] --> reserving : POST /orders (catalog lookup ok)
 
-    reserving --> cancelled : inventory-reserve 409 on any item\n[insufficient_stock]
-    reserving --> cancelled : Inventory Service unreachable mid-loop\n[inventory_unreachable]
-    reserving --> cancelled : sweep, stuck > 2 sec\n[reservation_incomplete]
-    reserving --> pending_charge : all items reserved
+    reserving --> cancelled : inventory-reserve batch response has any reserved=false\n[insufficient_stock]
+    reserving --> cancelled : Inventory Service unreachable\n[inventory_unreachable]
+    reserving --> cancelled : sweep, stuck > 14 sec\n[reservation_incomplete]
+    reserving --> pending_charge : batch response — all items reserved=true
 
     pending_charge --> confirmed : Payment.Charged
     pending_charge --> cancelled : Payment.Failed
@@ -274,9 +274,17 @@ Returns a single order and its line items.
 
 Published events are on `order.lifecycle` topic.
 
+Reservation is a single batch call — one request per order, covering every line item,
+not one request per product. The batch is **atomic in effect**: if any item can't be
+reserved, Inventory Service releases whatever it had already reserved for the other items
+in that same call before responding, so a failed batch never leaves a partial reservation
+behind. The per-item `reserved: true/false` flags are diagnostic only — they tell Order
+Service which product(s) caused the failure; they don't indicate items Order Service needs
+to release itself.
+
 | Request Endpoint | Request Body | Response Body |
 |---|---|---|
-| `POST /inventory/{productId}/order-reserve` | `{ "orderId": "ord_...", "quantity": 2 }` | `{ "productId": "8a2c...", "available": 14, "reserved": true }` |
+| `POST /inventory/order-reserve` | `{ "orderId": "c4d2...", "items": [{"productId": "8a2c...", "quantity": 2}, ...] }` | `{ "orderId": "c4d2...", "items": [{"productId": "8a2c...", "available": 10, "reserved": true}, ...] }` |
 
 | Published Event | Payload |
 |---|---|
@@ -349,33 +357,40 @@ Published events are on `order.lifecycle` topic.
    nothing else touched.
 
 2. **Catalog lookup.** `POST /products/lookup` with all merged `productIds` in one call.
-   - Any `notFound` → `400`. No order row, no reservation, no charge event.
-   - `found` entries give the authoritative `unitPrice` per line item (never trust a
-     client-supplied price).
-   - Catalog Service unreachable → `503`, order row never created.
+    - Any `notFound` → `400`. No order row, no reservation, no charge event.
+    - `found` entries give the authoritative `unitPrice` per line item (never trust a
+      client-supplied price).
+    - Catalog Service unreachable → `503`, order row never created.
 
 3. **Create order.** One DB transaction: insert `orders`
    (`status='reserving'`, `order_type='NORMAL'`, `total_price = Σ(unitPrice × qty)`)
-   + one `order_products` row per merged item (prices from step 2).
+    + one `order_products` row per merged item (prices from step 2).
 
-4. **Inventory reservation.** For each item, `POST /inventory/{productId}/order-reserve`
-   with the `orderId` from step 3.
-   - Any `409`, or Inventory Service unreachable mid-loop:
-     `UPDATE orders SET status='cancelled', cancel_reason=<'insufficient_stock'|'inventory_unreachable'> WHERE id=?`,
-     write `Order.NormalCancelled` to the outbox (all originally-requested items —
-     Inventory Service dedup, §4.2, no-ops the ones never actually reserved), commit,
-     return `409`/`503` immediately. No synchronous rollback call.
+4. **Inventory reservation.** Single batch call: `POST /inventory/order-reserve` with the
+   `orderId` from step 3 and every merged line item (`{productId, quantity}`) in one
+   request — not one call per product.
+    - Inventory Service unreachable (no response at all):
+      `UPDATE orders SET status='cancelled', cancel_reason='inventory_unreachable' WHERE id=?`,
+      write `Order.NormalCancelled` to the outbox (all originally-requested items), commit,
+      return `503` immediately.
+    - Response received but any item has `reserved: false`: Inventory Service has already
+      released any items it reserved for this call before responding,
+      so no reservation is left outstanding on Inventory Service's side.
+      `UPDATE orders SET status='cancelled', cancel_reason='insufficient_stock' WHERE id=?`,
+      write `Order.NormalCancelled` to the outbox listing all originally-requested items,
+      commit, return `409` immediately.
+    - All items come back `reserved: true` → proceed to step 5.
 
 5. **Charge.** `UPDATE orders SET status='pending_charge' WHERE id=? AND status='reserving'`,
    write `Payment.InitRequired.Charge` to the outbox (`{user_id, order_id, amount,
    payment_intent_id, idempotencyKey = order_id}`), commit. Order Service never calls
    Payment Service directly — Payment Service consumes this event, charges the card, and
    publishes `Payment.Charged` or `Payment.Failed` asynchronously.
-   - If Order Service's own consumer resolves the order within a short in-request wait
-     → return `201` (confirmed) or `402` (declined) synchronously.
-   - Otherwise → leave the order as `pending_charge`. Do not cancel/release yet — the
-     charge may still succeed on Payment Service's side; releasing now risks confirming a
-     payment against stock already sold to someone else. Return `202` immediately.
+    - If Order Service's own consumer resolves the order within a short in-request wait
+      → return `201` (confirmed) or `402` (declined) synchronously.
+    - Otherwise → leave the order as `pending_charge`. Do not cancel/release yet — the
+      charge may still succeed on Payment Service's side; releasing now risks confirming a
+      payment against stock already sold to someone else. Return `202` immediately.
 
 Resolution is either an inbound event or a sweep-fired outbound event.
 
@@ -405,21 +420,21 @@ Resolution is either an inbound event or a sweep-fired outbound event.
    authorizes the hold, and publishes `Payment.Authorized` or `Payment.Failed` asynchronously.
 
 2. **Authorization resolves.**
-   - **`Payment.Authorized` consumed:** `UPDATE orders SET status='authorized', payment_id=?
+    - **`Payment.Authorized` consumed:** `UPDATE orders SET status='authorized', payment_id=?
      WHERE id=? AND status='pending_authorization'` (guard). Call `authorize-slot` on Deal
-     Service synchronously (`authorized_count++`; this call may flip the deal to `succeeded`
-     on Deal Service's side). Fire `Order.Authorized`.
-   - **`Payment.Failed` consumed:** `UPDATE orders SET status='cancelled',
+      Service synchronously (`authorized_count++`; this call may flip the deal to `succeeded`
+      on Deal Service's side). Fire `Order.Authorized`.
+    - **`Payment.Failed` consumed:** `UPDATE orders SET status='cancelled',
      cancel_reason='payment_declined' WHERE id=? AND status='pending_authorization'` (guard).
-     Call `release-slot` (`reserved_stock--`; the order never reached `authorized`, so
-     `authorized_count` is untouched). Fire `Order.DealCancelled`.
+      Call `release-slot` (`reserved_stock--`; the order never reached `authorized`, so
+      `authorized_count` is untouched). Fire `Order.DealCancelled`.
 
 3. **Deal resolves.** Deal Service batches over every order still `authorized` for a
    `deal_id`, using `FOR UPDATE SKIP LOCKED` so concurrent batches don't collide:
-   - **`Deal.Succeeded` consumed:** batch `status='authorized' → 'pending_capture'`;
-     fire `Payment.SettlementRequired.Capture` (`{order_id, payment_id}`) per order.
-   - **`Deal.Failed` consumed:** batch `status='authorized' → 'pending_void'`;
-     fire `Payment.SettlementRequired.Void` (`{order_id, payment_id}`) per order.
+    - **`Deal.Succeeded` consumed:** batch `status='authorized' → 'pending_capture'`;
+      fire `Payment.SettlementRequired.Capture` (`{order_id, payment_id}`) per order.
+    - **`Deal.Failed` consumed:** batch `status='authorized' → 'pending_void'`;
+      fire `Payment.SettlementRequired.Void` (`{order_id, payment_id}`) per order.
 
 4. **Participant leaves (concurrent path).** Consuming `Participant.Left`: find the
    existing order `WHERE deal_id=? AND participant_id=? AND status='authorized'` — no new
@@ -428,14 +443,14 @@ Resolution is either an inbound event or a sweep-fired outbound event.
    `Payment.SettlementRequired.Void` (`{order_id, payment_id}`).
 
 5. **Settlement resolves.**
-   - **`Payment.Captured` consumed:** `UPDATE orders SET status='confirmed', payment_id=?
+    - **`Payment.Captured` consumed:** `UPDATE orders SET status='confirmed', payment_id=?
      WHERE id=? AND status='pending_capture'` (guard). Fire `Order.Created`.
-   - **`Payment.Voided` consumed:** `UPDATE orders SET status='cancelled',
+    - **`Payment.Voided` consumed:** `UPDATE orders SET status='cancelled',
      cancel_reason=<'deal_failed'|'participant_left'> WHERE id=? AND status='pending_void'`
-     (guard; reason depends on which path parked the order). Leave path only: call
-     `release-authorized-slot` (`reserved_stock--` and `authorized_count--` atomically —
-     the order had reached `authorized` before parking, unlike the plain `release-slot`
-     case in step 2). Fire `Order.DealCancelled`.
+      (guard; reason depends on which path parked the order). Leave path only: call
+      `release-authorized-slot` (`reserved_stock--` and `authorized_count--` atomically —
+      the order had reached `authorized` before parking, unlike the plain `release-slot`
+      case in step 2). Fire `Order.DealCancelled`.
 
 **Reconciliation sweep**, every ~30s, thresholds are 60s (vs. 5 min/2 sec for NORMAL —
 deals settle on a much tighter clock):
