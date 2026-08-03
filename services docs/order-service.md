@@ -16,7 +16,7 @@ erDiagram
         varchar status
         numeric total_price
         uuid payment_id "nullable, set by Payment Service"
-        varchar payment_intent_id
+        varchar payment_intent_id "nullable, set from Payment.* result events, not request-time"
         varchar cancel_reason
         int version
         timestamptz created_at
@@ -62,7 +62,7 @@ erDiagram
 - `orders.status` is one of `RESERVING, PENDING_CHARGE, PENDING_AUTHORIZATION, AUTHORIZED,
   PENDING_CAPTURE, PENDING_VOID, CONFIRMED, CANCELLED`; `cancel_reason` is one of
   `INSUFFICIENT_STOCK, INVENTORY_UNREACHABLE, RESERVATION_INCOMPLETE, PAYMENT_DECLINED,
-  PAYMENT_TIMEOUT, DEAL_FAILED, PARTICIPANT_LEFT`.
+  PAYMENT_TIMEOUT, DEAL_FAILED, DEAL_RESOLVED, PARTICIPANT_LEFT`.
 - `deal_fields_consistency` check: `deal_id`/`participant_id` set together for `DEAL`,
   both null for `NORMAL`.
 - Unique index on `(deal_id, participant_id) WHERE order_type = 'DEAL'` — guards against a
@@ -119,32 +119,33 @@ stateDiagram-v2
     pending_authorization --> cancelled : Payment.Failed
     pending_authorization --> cancelled : sweep, stuck > 60s
 
-    authorized --> pending_capture : Deal.Succeeded batch(SKIP LOCKED)
-    authorized --> pending_void : Deal.Failed batch(SKIP LOCKED)
+    authorized --> pending_capture : Deal.Succeeded batch(guarded UPDATE)
+    authorized --> pending_void : Deal.Failed batch(guarded UPDATE)
     authorized --> pending_void : Participant.Left(guarded UPDATE)
+    authorized --> pending_void : late Payment.Authorized, deal already resolved\n[deal_resolved]
 
     pending_capture --> confirmed : Payment.Captured
+    pending_capture --> pending_capture : sweep, stuck > 60s (re-publish Capture)
 
     pending_void --> cancelled : Payment.Voided
+    pending_void --> pending_void : sweep, stuck > 60s (re-publish Void)
 
     confirmed --> [*]
     cancelled --> [*]
 ```
 
-**Sweep behavior differs by stage**: orders stuck in
-`pending_authorization` > 60s are **force-cancelled** (silence = failure; `release-slot`
-called — `reserved_stock--` only, since the order never reached `authorized`). Orders stuck
-in `pending_capture` or `pending_void` > 60s are instead **re-published**: the same
-`order.payment_settlement_requested` (type=CAPTURE/VOID, idempotencyKey=payment_id) fires
-again, never a cancel, because capture/void against an existing `payment_id` is idempotent
-and the deal outcome is already decided at that point.
+**Sweep behavior differs by stage**: orders stuck in `pending_authorization` > 60s are
+**force-cancelled** (`release-slot`, `Order.DealCancelled`, `Payment.Timeout`). Orders stuck
+in `pending_capture`/`pending_void` > 60s are instead **re-published**: the same
+`Payment.SettlementRequired.Capture`/`Void` fires again, never a cancel.
 
-Both void paths park the order in `pending_void` before firing the VOID (team decision):
-the `deal.Failed` batch does it via `FOR UPDATE SKIP LOCKED`, and the participant-leave
-path does it via a guarded `UPDATE ... WHERE status = 'authorized'` immediately on consuming
-`participant.Left`. This closes the race where a concurrent `deal.Succeeded`/`deal.Failed`
-batch over the same `deal_id` could grab an order whose leave-void was still in flight —
-the batch selects `WHERE status = 'authorized'` and skips anything already parked.
+Three paths park an order in `pending_void`, all via a guarded `UPDATE ... WHERE status =
+'authorized'`: the `Deal.Failed` batch (§6 step 3), the participant-leave path (on
+`Participant.Left`), and a **late-authorization** race — `Payment.Authorized` is consumed and
+the order reaches `authorized`, but the following `authorize-slot` call is rejected because
+the deal already resolved. That order is immediately re-parked `authorized → pending_void`
+with `cancel_reason = deal_resolved`, `release-slot` is called (not `release-authorized-slot`
+— Deal Service never counted this slot), and `Order.Authorized` is not fired.
 
 ---
 
@@ -227,7 +228,7 @@ Returns a single order and its line items.
 ```json
 {
   "userId": "b3f1...",
-  "paymentIntentId": "pi_...",
+  "paymentMethodId": "pm_...",
   "items": [
     { "productId": "8a2c...", "quantity": 2 },
     { "productId": "c091...", "quantity": 1 }
@@ -294,14 +295,14 @@ to release itself.
 
 | Request Endpoint | Request Body | Expected Action |
 |---|---|---|
-| `POST /deals/{deal_id}/authorize-slot` | None | increment `authorized_count` |
+| `POST /deals/{deal_id}/authorize-slot` | None | increment `authorized_count`, or reject (returns non-2xx) if the deal has already resolved |
 | `POST /deals/{deal_id}/release-slot` | None | decrement `reserved_stock` |
-| `POST /deals/{deal_id}/release-authorized-slot` | None | increment `reserved_stock` & `authorized_count` |
+| `POST /deals/{deal_id}/release-authorized-slot` | None | decrement `reserved_stock` & `authorized_count` |
 
 | Received Event | Payload | Reaction |
 |---|---|---|
-| `Deal.Succeeded` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: `SELECT ... WHERE deal_id = ? AND status = authorized FOR UPDATE SKIP LOCKED` → `status = pending_capture`<br>2. Fire `Order.payment_settlement_requested(payment_id, 'CAPTURE')` per order |
-| `Deal.Failed` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: same pattern → `status = pending_void`<br>2. Fire `Order.payment_settlement_requested(order_id, payment_id, 'VOID')` per order |
+| `Deal.Succeeded` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: `SELECT ... WHERE deal_id = ? AND status = 'authorized'`, then per order a guarded `UPDATE ... WHERE id = ? AND status = 'authorized'` → `status = pending_capture`<br>2. Fire `Order.payment_settlement_requested(payment_id, 'CAPTURE')` per order whose guarded update affected a row |
+| `Deal.Failed` | `(deal_id, deal_stock, authorized_count)` | 1. Batch: same pattern → `status = pending_void`<br>2. Fire `Order.payment_settlement_requested(order_id, payment_id, 'VOID')` per order whose guarded update affected a row |
 
 ### 4.4 Payment Service
 
@@ -310,8 +311,8 @@ to release itself.
 
 | Published Event | Payload | Reaction |
 |---|---|---|
-| `Payment.InitRequired.Charge` | `{user_id, order_id, amount, payment_intent_id}` | Charge the amount using `paymentIntentId` |
-| `Payment.InitRequired.Authorize` | `{user_id, order_id, amount, payment_intent_id}` | Authorize the amount using `paymentIntentId` |
+| `Payment.InitRequired.Charge` | `{user_id, order_id, amount, payment_method_id}` | Charge the amount using `paymentMethodId` |
+| `Payment.InitRequired.Authorize` | `{user_id, order_id, amount, payment_method_id}` | Authorize the amount using `paymentMethodId` |
 | `Payment.SettlementRequired.Capture` | `{order_id, payment_id}` | Capture the held amount |
 | `Payment.SettlementRequired.Void` | `{order_id, payment_id}` | Release the held amount |
 | `Payment.Timeout` | `{order_id}` | Cancel a stuck order |
@@ -320,9 +321,9 @@ to release itself.
 |---|---|---|
 | `Payment.Failed` | `(payment_id, payment_intent_id, order_id, amount, errorMessage, errorCode)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status IN (pending_charge, pending_authorization)` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. DEAL path only: call `release-slot` (sync — `reserved_stock--`; order never reached `authorized`, so `authorized_count` is untouched)<br>5. Fire `Order.NormalCancelled` (NORMAL) or `Order.DealCancelled` (DEAL) |
 | `Payment.Charged` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_charge` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Fire `Order.Created` |
-| `Payment.Authorized` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = authorized WHERE status = pending_authorization` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Call `authorize-slot` (sync — `authorized_count++`; deal may flip `succeeded` here)<br>5. Fire `Order.Authorized` |
+| `Payment.Authorized` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = authorized WHERE status = pending_authorization` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Call `authorize-slot` (sync — `authorized_count++`; deal may flip `succeeded` here)<br>5a. Slot claimed → fire `Order.Authorized`<br>5b. Slot rejected (deal already resolved before this call landed — **late authorization**) → `UPDATE status = pending_void WHERE status = authorized` (guard), `cancel_reason = deal_resolved`, call `release-slot` (not `release-authorized-slot` — Deal Service never counted this slot), fire `Payment.SettlementRequired.Void`; `Order.Authorized` is **not** fired |
 | `Payment.Captured` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_capture` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Fire `Order.Created` |
-| `Payment.Voided` | `(order_id, payment_id, payment_intent_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard), `cancel_reason` = `deal_failed` or `participant_left` depending on which path parked the order<br>3. Leave path only: call `release-authorized-slot` (sync — `reserved_stock--` and `authorized_count--` atomically; order had reached `authorized` before parking)<br>4. Fire `Order.DealCancelled` |
+| `Payment.Voided` | `(order_id, payment_id, payment_intent_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard), `cancel_reason` = `deal_failed`, `participant_left`, or `deal_resolved` depending on which path parked the order<br>3. Leave path only: call `release-authorized-slot` (sync — `reserved_stock--` and `authorized_count--` atomically; order had reached `authorized` before parking)<br>4. Fire `Order.DealCancelled` |
 
 ### 4.5 Participation Service
 
@@ -334,7 +335,7 @@ Published events are on `order.lifecycle` topic.
 
 | Received Event | Payload | Reaction |
 |---|---|---|
-| `Participant.Joined` | `(participant_id, deal_id, user_id, product_id, price, payment_intent_id)` | 1. Create order row, `status = pending_authorization`, `payment_intent_id` from event (+ `order_products` row)<br>2. Fire `Payment.InitRequired.Authorize(user_id, order_id, amount, payment_intent_id)` |
+| `Participant.Joined` | `(participant_id, deal_id, user_id, product_id, price, payment_method_id)` | 1. Create order row, `status = pending_authorization` (+ `order_products` row); `payment_intent_id` is **not** set here — it's only known once Payment Service resolves the authorization and Order Service consumes the resulting `Payment.Authorized`/`Payment.Failed` event<br>2. Fire `Payment.InitRequired.Authorize(user_id, order_id, amount, payment_method_id)` |
 | `Participant.Left` | `(participant_id, deal_id)` | 1. Find existing order `WHERE deal_id = ? AND participant_id = ? AND status = authorized` — no new row created<br>2. `UPDATE status = pending_void WHERE status = authorized` (guard — parks the order so deal-resolution batches skip it)<br>3. Fire `Payment.SettlementRequired.Void(order_id, payment_id)` |
 
 ### 4.6 Notification Service
@@ -383,7 +384,7 @@ Published events are on `order.lifecycle` topic.
 
 5. **Charge.** `UPDATE orders SET status='pending_charge' WHERE id=? AND status='reserving'`,
    write `Payment.InitRequired.Charge` to the outbox (`{user_id, order_id, amount,
-   payment_intent_id, idempotencyKey = order_id}`), commit. Order Service never calls
+   payment_method_id}`), commit. Order Service never calls
    Payment Service directly — Payment Service consumes this event, charges the card, and
    publishes `Payment.Charged` or `Payment.Failed` asynchronously.
     - If Order Service's own consumer resolves the order within a short in-request wait
@@ -413,28 +414,39 @@ Resolution is either an inbound event or a sweep-fired outbound event.
 
 1. **Join.** Consuming `Participant.Joined`: insert `orders` (`status='pending_authorization'`,
    `order_type='DEAL'`, `deal_id`, `participant_id` from the event) + one `order_products`
-   row (`quantity=1`, `unit_price` = event's `price`). `payment_intent_id` comes from the
-   event, not generated locally. Write `Payment.InitRequired.Authorize`
-   (`{user_id, order_id, amount, payment_intent_id, idempotencyKey = order_id}`) to the
-   outbox and commit. No synchronous call to Payment Service — it consumes this event,
-   authorizes the hold, and publishes `Payment.Authorized` or `Payment.Failed` asynchronously.
+   row (`quantity=1`, `unit_price` = event's `price`). `payment_method_id` comes from the
+   event; `payment_intent_id` is left unset at this point — it's only known once Payment
+   Service resolves the authorization and Order Service consumes the resulting
+   `Payment.Authorized`/`Payment.Failed` event. Write `Payment.InitRequired.Authorize`
+   (`{user_id, order_id, amount, payment_method_id}`) to the outbox and commit. No
+   synchronous call to Payment Service — it consumes this event, authorizes the hold, and
+   publishes `Payment.Authorized` or `Payment.Failed` asynchronously.
 
 2. **Authorization resolves.**
     - **`Payment.Authorized` consumed:** `UPDATE orders SET status='authorized', payment_id=?
      WHERE id=? AND status='pending_authorization'` (guard). Call `authorize-slot` on Deal
       Service synchronously (`authorized_count++`; this call may flip the deal to `succeeded`
-      on Deal Service's side). Fire `Order.Authorized`.
+      on Deal Service's side).
+        - Slot claimed → fire `Order.Authorized`.
+        - Slot rejected (**late authorization** — the deal already resolved before this call
+          landed) → `UPDATE orders SET status='pending_void', cancel_reason='deal_resolved'
+          WHERE id=? AND status='authorized'` (guard), call `release-slot` (not
+          `release-authorized-slot` — Deal Service never counted this slot as authorized),
+          fire `Payment.SettlementRequired.Void`. `Order.Authorized` is not fired.
     - **`Payment.Failed` consumed:** `UPDATE orders SET status='cancelled',
      cancel_reason='payment_declined' WHERE id=? AND status='pending_authorization'` (guard).
       Call `release-slot` (`reserved_stock--`; the order never reached `authorized`, so
       `authorized_count` is untouched). Fire `Order.DealCancelled`.
 
 3. **Deal resolves.** Deal Service batches over every order still `authorized` for a
-   `deal_id`, using `FOR UPDATE SKIP LOCKED` so concurrent batches don't collide:
-    - **`Deal.Succeeded` consumed:** batch `status='authorized' → 'pending_capture'`;
-      fire `Payment.SettlementRequired.Capture` (`{order_id, payment_id}`) per order.
-    - **`Deal.Failed` consumed:** batch `status='authorized' → 'pending_void'`;
-      fire `Payment.SettlementRequired.Void` (`{order_id, payment_id}`) per order.
+   `deal_id`: `SELECT ... WHERE deal_id = ? AND status = 'authorized'`, then per order a
+   guarded `UPDATE ... WHERE id = ? AND status = 'authorized'`:
+    - **`Deal.Succeeded` consumed:** per order, guarded `status='authorized' → 'pending_capture'`;
+      fire `Payment.SettlementRequired.Capture` (`{order_id, payment_id}`) for each order
+      whose update affected a row.
+    - **`Deal.Failed` consumed:** per order, guarded `status='authorized' → 'pending_void'`;
+      fire `Payment.SettlementRequired.Void` (`{order_id, payment_id}`) for each order whose
+      update affected a row.
 
 4. **Participant leaves (concurrent path).** Consuming `Participant.Left`: find the
    existing order `WHERE deal_id=? AND participant_id=? AND status='authorized'` — no new
@@ -446,21 +458,20 @@ Resolution is either an inbound event or a sweep-fired outbound event.
     - **`Payment.Captured` consumed:** `UPDATE orders SET status='confirmed', payment_id=?
      WHERE id=? AND status='pending_capture'` (guard). Fire `Order.Created`.
     - **`Payment.Voided` consumed:** `UPDATE orders SET status='cancelled',
-     cancel_reason=<'deal_failed'|'participant_left'> WHERE id=? AND status='pending_void'`
-      (guard; reason depends on which path parked the order). Leave path only: call
-      `release-authorized-slot` (`reserved_stock--` and `authorized_count--` atomically —
-      the order had reached `authorized` before parking, unlike the plain `release-slot`
-      case in step 2). Fire `Order.DealCancelled`.
+     cancel_reason=<'deal_failed'|'participant_left'|'deal_resolved'> WHERE id=? AND
+      status='pending_void'` (guard; reason depends on which path parked the order). Leave
+      path only: call `release-authorized-slot` (`reserved_stock--` and `authorized_count--`
+      atomically — the order had reached `authorized` before parking, unlike the plain
+      `release-slot` case used for `deal_resolved`/`Payment.Failed`). Fire
+      `Order.DealCancelled`.
 
 **Reconciliation sweep**, every ~30s, thresholds are 60s (vs. 5 min/2 sec for NORMAL —
 deals settle on a much tighter clock):
 - Orders in `pending_authorization` past 60s → **force-cancel**: `UPDATE status='cancelled',
   cancel_reason='payment_timeout' WHERE status='pending_authorization'` (guard), call
-  `release-slot`, fire `Order.DealCancelled`. Silence is treated as failure.
+  `release-slot`, fire `Order.DealCancelled` and `Payment.Timeout` (`{order_id}`).
 - Orders in `pending_capture` or `pending_void` past 60s → **re-publish**, never cancel:
-  re-fire the same `Payment.SettlementRequired.Capture`/`Void` with
-  `idempotencyKey=payment_id`. Capture/void against an existing `payment_id` is idempotent,
-  and the deal outcome is already decided once an order reaches these states.
+  re-fire the same `Payment.SettlementRequired.Capture`/`Void`.
 
 ---
 
@@ -499,7 +510,8 @@ CREATE TABLE orders (
     payment_intent_id VARCHAR(255) NULL,
     cancel_reason     VARCHAR(30) NULL CHECK (cancel_reason IN (
                           'INSUFFICIENT_STOCK', 'INVENTORY_UNREACHABLE', 'RESERVATION_INCOMPLETE',
-                          'PAYMENT_DECLINED', 'PAYMENT_TIMEOUT', 'DEAL_FAILED', 'PARTICIPANT_LEFT'
+                          'PAYMENT_DECLINED', 'PAYMENT_TIMEOUT', 'DEAL_FAILED', 'DEAL_RESOLVED',
+                          'PARTICIPANT_LEFT'
                       )),
 
     version           INT NOT NULL DEFAULT 0,  -- optimistic locking / race auditing
