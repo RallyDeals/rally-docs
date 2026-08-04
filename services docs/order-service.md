@@ -30,6 +30,8 @@ erDiagram
         uuid product_id
         int quantity "always 1 for DEAL"
         numeric unit_price
+        varchar product_name
+        varchar product_image_url
         timestamptz created_at
     }
 
@@ -174,8 +176,8 @@ Paginated list of a user's orders, filterable by `status` and `orderType`.
       "status": "confirmed",
       "totalPrice": 129.97,
       "items": [
-        { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-        { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+        { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "price": 39.99 },
+        { "productId": "c091...", "name": "USB-C Hub", "imageUrl": "https://cdn.../hub.jpg", "quantity": 1, "price": 49.99 }
       ],
       "createdAt": "2026-07-12T10:15:00Z"
     }
@@ -207,8 +209,8 @@ Returns a single order and its line items.
   "status": "confirmed",
   "totalPrice": 129.97,
   "items": [
-    { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-    { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+    { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "price": 39.99 },
+    { "productId": "c091...", "name": "USB-C Hub", "imageUrl": "https://cdn.../hub.jpg", "quantity": 1, "price": 49.99 }
   ],
   "createdAt": "2026-07-12T10:15:00Z"
 }
@@ -246,8 +248,8 @@ Returns a single order and its line items.
   "totalPrice": 129.97,
   "paymentIntentId": "pi_...",
   "items": [
-    { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-    { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+    { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "price": 39.99 },
+    { "productId": "c091...", "name": "USB-C Hub", "imageUrl": "https://cdn.../hub.jpg", "quantity": 1, "price": 49.99 }
   ],
   "createdAt": "2026-07-12T10:15:00Z"
 }
@@ -269,7 +271,7 @@ Returns a single order and its line items.
 
 | Request Endpoint | Request Body | Response Body |
 |---|---|---|
-| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": [{ "id": "8a2c...", "basePrice": 39.99 }], "notFound": ["c091..."] }` |
+| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": { "8a2c...": { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "price": 39.99 } }, "notFound": ["c091..."] }` |
 
 ### 4.2 Inventory Service
 
@@ -359,12 +361,12 @@ Published events are on `order.lifecycle` topic.
 
 2. **Catalog lookup.** `POST /products/lookup` with all merged `productIds` in one call.
     - Any `notFound` → `400`. No order row, no reservation, no charge event.
-    - `found` entries give the authoritative `unitPrice` per line item (never trust a
+    - `found` entries give the authoritative `price` per line item (never trust a
       client-supplied price).
     - Catalog Service unreachable → `503`, order row never created.
 
 3. **Create order.** One DB transaction: insert `orders`
-   (`status='reserving'`, `order_type='NORMAL'`, `total_price = Σ(unitPrice × qty)`)
+   (`status='reserving'`, `order_type='NORMAL'`, `total_price = Σ(price × qty)`)
     + one `order_products` row per merged item (prices from step 2).
 
 4. **Inventory reservation.** Single batch call: `POST /inventory/order-reserve` with the
@@ -575,12 +577,14 @@ CREATE TRIGGER trg_orders_status_updated_at
 -- =====================================================================
 
 CREATE TABLE order_products (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    order_id    UUID NOT NULL REFERENCES orders(id),
-    product_id  UUID NOT NULL,
-    quantity    INT NOT NULL CHECK (quantity > 0),   -- always 1 for DEAL, can be >1 for NORMAL
-    unit_price  NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id           UUID NOT NULL REFERENCES orders(id),
+    product_id         UUID NOT NULL,
+    quantity           INT NOT NULL CHECK (quantity > 0),   -- always 1 for DEAL, can be >1 for NORMAL
+    unit_price         NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
+    product_name       VARCHAR(255) NULL,     -- added V10; Catalog product-name snapshot at order-creation time
+    product_image_url VARCHAR(1000) NULL,     -- added V10; Catalog image-url snapshot at order-creation time
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_order_products_order_id ON order_products (order_id);
