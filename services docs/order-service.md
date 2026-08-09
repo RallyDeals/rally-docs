@@ -323,7 +323,7 @@ to release itself.
 
 | Published Event | Payload |
 |---|---|
-| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, [{product_id, quantity}])` |
+| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, payment_error_message)` |
 
 ### 4.3 Deal Service
 
@@ -377,7 +377,7 @@ Published events are on `order.lifecycle` topic.
 
 | Published Event | Payload |
 |---|---|
-| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason)` |
+| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price)` |
 
 | Received Event | Payload | Reaction |
 |---|---|---|
@@ -390,10 +390,10 @@ Published events are on `order.lifecycle` topic.
 
 | Published Event | Payload |
 |---|---|
-| `Order.Created` | `{order_id, user_id, items}` |
-| `Order.Authorized` | `{deal_id, user_id}` |
-| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, [{product_id, quantity}])` |
-| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason)` |
+| `Order.Created` | `{order_id, user_id, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, address}` |
+| `Order.Authorized` | `{order_id, deal_id, user_id, total_price}` |
+| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, payment_error_message)` |
+| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price)` |
 
 ---
 
@@ -449,8 +449,10 @@ Resolution is either an inbound event or a sweep-fired outbound event.
   WHERE id=? AND status='pending_charge'`; if the update affected a row, fire `Order.Created`.
 - **Case 2 — `Payment.Failed`:** `UPDATE orders SET status='cancelled',
   cancel_reason='payment_declined' WHERE id=? AND status='pending_charge'`; if the update
-  affected a row, set `payment_id`, then fire `Order.NormalCancelled` (`{order_id, user_id,
-  cancelReason, [{product_id, quantity}]}`). Inventory Service reacts the same way it reacts
+  affected a row, set `payment_id`, `payment_error_code`, `payment_error_message`, then fire
+  `Order.NormalCancelled` (`{order_id, user_id, cancelReason, items: [{product_id, product_name,
+  product_image_url, quantity, unit_price}], total_price, payment_error_message}`). Inventory
+  Service reacts the same way it reacts
   to every other `Order.NormalCancelled` (§4.2) — Order Service doesn't call `order-release`
   itself.
 
