@@ -15,9 +15,15 @@ erDiagram
         uuid participant_id "required if DEAL"
         varchar status
         numeric total_price
+        text address
         uuid payment_id "nullable, set by Payment Service"
-        varchar payment_intent_id "nullable, set from Payment.* result events, not request-time"
+        varchar card_last4 "nullable, snapshot fetched sync from Payment Service at order-creation time"
+        varchar card_brand "nullable, same snapshot"
+        varchar card_exp_month "nullable, same snapshot; VARCHAR since V12 — Payment Service returns it as a string"
+        varchar card_exp_year "nullable, same snapshot; VARCHAR since V12"
         varchar cancel_reason
+        varchar payment_error_code "nullable, added V14; Payment Service's declined-reason code"
+        text payment_error_message "nullable, added V14; populated only when payment_error_code = card_declined"
         int version
         timestamptz created_at
         timestamptz updated_at
@@ -30,6 +36,8 @@ erDiagram
         uuid product_id
         int quantity "always 1 for DEAL"
         numeric unit_price
+        varchar product_name "nullable, snapshot at order-creation time"
+        varchar product_image_url "nullable, snapshot at order-creation time"
         timestamptz created_at
     }
 
@@ -125,27 +133,22 @@ stateDiagram-v2
     authorized --> pending_void : late Payment.Authorized, deal already resolved\n[deal_resolved]
 
     pending_capture --> confirmed : Payment.Captured
-    pending_capture --> pending_capture : sweep, stuck > 60s (re-publish Capture)
 
     pending_void --> cancelled : Payment.Voided
-    pending_void --> pending_void : sweep, stuck > 60s (re-publish Void)
 
     confirmed --> [*]
     cancelled --> [*]
 ```
 
-**Sweep behavior differs by stage**: orders stuck in `pending_authorization` > 60s are
-**force-cancelled** (`release-slot`, `Order.DealCancelled`, `Payment.Timeout`). Orders stuck
-in `pending_capture`/`pending_void` > 60s are instead **re-published**: the same
-`Payment.SettlementRequired.Capture`/`Void` fires again, never a cancel.
+**Sweep only covers `pending_authorization`**: orders stuck there > 60s are
+**force-cancelled** (`release-slot`, `Order.DealCancelled`, `Payment.Timeout`).
 
 Three paths park an order in `pending_void`, all via a guarded `UPDATE ... WHERE status =
 'authorized'`: the `Deal.Failed` batch (§6 step 3), the participant-leave path (on
 `Participant.Left`), and a **late-authorization** race — `Payment.Authorized` is consumed and
 the order reaches `authorized`, but the following `authorize-slot` call is rejected because
 the deal already resolved. That order is immediately re-parked `authorized → pending_void`
-with `cancel_reason = deal_resolved`, `release-slot` is called (not `release-authorized-slot`
-— Deal Service never counted this slot), and `Order.Authorized` is not fired.
+with `cancel_reason = deal_resolved`, `release-slot` is called and `Order.Authorized` is not fired.
 
 ---
 
@@ -174,8 +177,8 @@ Paginated list of a user's orders, filterable by `status` and `orderType`.
       "status": "confirmed",
       "totalPrice": 129.97,
       "items": [
-        { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-        { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+        { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "price": 39.99 },
+        { "productId": "c091...", "name": "USB-C Hub", "imageUrl": "https://cdn.../hub.jpg", "quantity": 1, "price": 49.99 }
       ],
       "createdAt": "2026-07-12T10:15:00Z"
     }
@@ -196,21 +199,47 @@ Paginated list of a user's orders, filterable by `status` and `orderType`.
 
 ### 3.2 `GET /orders/{id}`
 
-Returns a single order and its line items.
+Returns a single order and its line items. Response shape mirrors `DetailedOrderResponse`
+field-for-field (see Appendix for the underlying columns).
 
 **Response — 200**
 ```json
 {
-  "id": "ord_...",
+  "orderId": "c4d2...",
   "userId": "b3f1...",
   "orderType": "NORMAL",
-  "status": "confirmed",
+  "dealId": null,
+  "participantId": null,
+  "status": "CONFIRMED",
+  "cancelReason": null,
+  "paymentErrorCode": null,
+  "paymentErrorMessage": null,
   "totalPrice": 129.97,
-  "items": [
-    { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-    { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+  "address": "123 Main St, Springfield",
+  "paymentId": "9f4e...",
+  "cardLast4": "4242",
+  "cardBrand": "visa",
+  "cardExpMonth": "12",
+  "cardExpYear": "2030",
+  "orderProducts": [
+    { "productId": "8a2c...", "productName": "Wireless Mouse", "productImageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "unitPrice": 39.99 },
+    { "productId": "c091...", "productName": "USB-C Hub", "productImageUrl": "https://cdn.../hub.jpg", "quantity": 1, "unitPrice": 49.99 }
   ],
-  "createdAt": "2026-07-12T10:15:00Z"
+  "createdAt": "2026-07-12T10:15:00Z",
+  "updatedAt": "2026-07-12T10:15:04Z",
+  "statusUpdatedAt": "2026-07-12T10:15:04Z"
+}
+```
+
+A cancelled order (e.g. a card decline) additionally populates `cancelReason`,
+`paymentErrorCode`, and — only when `paymentErrorCode` is `card_declined` —
+`paymentErrorMessage`:
+```json
+{
+  "status": "CANCELLED",
+  "cancelReason": "PAYMENT_DECLINED",
+  "paymentErrorCode": "card_declined",
+  "paymentErrorMessage": "Your card has insufficient funds."
 }
 ```
 
@@ -229,6 +258,7 @@ Returns a single order and its line items.
 {
   "userId": "b3f1...",
   "paymentMethodId": "pm_...",
+  "address": "123 Main St, Springfield",
   "items": [
     { "productId": "8a2c...", "quantity": 2 },
     { "productId": "c091...", "quantity": 1 }
@@ -244,10 +274,14 @@ Returns a single order and its line items.
   "orderType": "NORMAL",
   "status": "confirmed",
   "totalPrice": 129.97,
-  "paymentIntentId": "pi_...",
+  "address": "123 Main St, Springfield",
+  "cardLast4": "4242",
+  "cardBrand": "visa",
+  "cardExpMonth": "12",
+  "cardExpYear": "2030",
   "items": [
-    { "productId": "8a2c...", "quantity": 2, "unitPrice": 39.99 },
-    { "productId": "c091...", "quantity": 1, "unitPrice": 49.99 }
+    { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "quantity": 2, "price": 39.99 },
+    { "productId": "c091...", "name": "USB-C Hub", "imageUrl": "https://cdn.../hub.jpg", "quantity": 1, "price": 49.99 }
   ],
   "createdAt": "2026-07-12T10:15:00Z"
 }
@@ -256,9 +290,9 @@ Returns a single order and its line items.
 **Errors**
 | Status | Cause | Body |
 |---|---|---|
-| 400 | empty cart, bad quantity, unknown field | `{ "error": "..." }` |
+| 400 | empty cart, bad quantity, missing `address`/`paymentMethodId`, unknown field | `{ "error": "..." }` |
 | 404 | `productId` doesn't exist | `{ "error": "..." }` |
-| 402 | Payment Service declined authorize/capture | `{ "error": "card_declined", "paymentIntentId": "pi_..." }` — `paymentIntentId` is still returned since Stripe creates the intent before declining it |
+| 402 | Payment Service declined authorize/capture | `{ "error": "card_declined" }` |
 | 503 | Payment Service or Catalog Service unreachable | `{ "error": "..." }` — no order persisted as `confirmed`; see order-service-spec.md §9.2 for the fail-fast-vs-reconcile decision |
 
 ---
@@ -269,7 +303,7 @@ Returns a single order and its line items.
 
 | Request Endpoint | Request Body | Response Body |
 |---|---|---|
-| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": [{ "id": "8a2c...", "basePrice": 39.99 }], "notFound": ["c091..."] }` |
+| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": { "8a2c...": { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "price": 39.99 } }, "notFound": ["c091..."] }` |
 
 ### 4.2 Inventory Service
 
@@ -289,7 +323,7 @@ to release itself.
 
 | Published Event | Payload |
 |---|---|
-| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, [{product_id, quantity}])` |
+| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, payment_error_message)` |
 
 ### 4.3 Deal Service
 
@@ -308,6 +342,9 @@ to release itself.
 
 - Order Service publishes payment-related events on `order.payments_requested`.
 - Order Service receives payment-related events on `Payment.events`.
+- Order Service additionally makes one **synchronous** call to Payment Service to fetch a
+  card snapshot for display, keyed by `(user_id, payment_method_id)`. The
+  call happens once, at order-creation time (DEAL: `Participant.Joined`; NORMAL: checkout).
 
 | Published Event | Payload | Reaction |
 |---|---|---|
@@ -315,15 +352,24 @@ to release itself.
 | `Payment.InitRequired.Authorize` | `{user_id, order_id, amount, payment_method_id}` | Authorize the amount using `paymentMethodId` |
 | `Payment.SettlementRequired.Capture` | `{order_id, payment_id}` | Capture the held amount |
 | `Payment.SettlementRequired.Void` | `{order_id, payment_id}` | Release the held amount |
-| `Payment.Timeout` | `{order_id}` | Cancel a stuck order |
+| `Payment.Timeout` | `{order_id}` | Cancel a stuck order — fired when no payment outcome ever arrived |
+
+| Sync Call | Request | Response | Reaction |
+|---|---|---|---|
+| `GET /api/users/{user_id}/payment-methods/{payment_method_id}` | — | `{id, user_id, type, isDefault, card_last4, card_brand, card_exp_month, card_exp_year, card_fingerprint}` | Called once at order-creation time `card_last4`/`card_brand`/`card_exp_month`/`card_exp_year` are stored on the order as part of the same insert. |
 
 | Received Event | Payload | Reaction |
 |---|---|---|
-| `Payment.Failed` | `(payment_id, payment_intent_id, order_id, amount, errorMessage, errorCode)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status IN (pending_charge, pending_authorization)` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. DEAL path only: call `release-slot` (sync — `reserved_stock--`; order never reached `authorized`, so `authorized_count` is untouched)<br>5. Fire `Order.NormalCancelled` (NORMAL) or `Order.DealCancelled` (DEAL) |
-| `Payment.Charged` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_charge` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Fire `Order.Created` |
-| `Payment.Authorized` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = authorized WHERE status = pending_authorization` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Call `authorize-slot` (sync — `authorized_count++`; deal may flip `succeeded` here)<br>5a. Slot claimed → fire `Order.Authorized`<br>5b. Slot rejected (deal already resolved before this call landed — **late authorization**) → `UPDATE status = pending_void WHERE status = authorized` (guard), `cancel_reason = deal_resolved`, call `release-slot` (not `release-authorized-slot` — Deal Service never counted this slot), fire `Payment.SettlementRequired.Void`; `Order.Authorized` is **not** fired |
-| `Payment.Captured` | `(payment_id, payment_intent_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_capture` (guard)<br>3. Set `payment_id` + `payment_intent_id`<br>4. Fire `Order.Created` |
-| `Payment.Voided` | `(order_id, payment_id, payment_intent_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard), `cancel_reason` = `deal_failed`, `participant_left`, or `deal_resolved` depending on which path parked the order<br>3. Leave path only: call `release-authorized-slot` (sync — `reserved_stock--` and `authorized_count--` atomically; order had reached `authorized` before parking)<br>4. Fire `Order.DealCancelled` |
+| `Payment.Failed` | `(payment_id, order_id, amount, errorMessage, errorCode)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status IN (pending_charge, pending_authorization)` (guard)<br>3. Set `payment_id` — no card-snapshot fetch here, it was already captured at order-creation time<br>4. Set `payment_error_code`/`payment_error_message` from the event, verbatim — `errorCode` is one of `card_declined`, `incorrect_cvc`, `processing_error`, `expired_card`; `errorMessage` is only populated by Payment Service when `errorCode = card_declined`, otherwise `null`<br>5. DEAL path only: call `release-slot` (sync — `reserved_stock--`; order never reached `authorized`, so `authorized_count` is untouched)<br>6. Fire `Order.NormalCancelled` (NORMAL) or `Order.DealCancelled` (DEAL) |
+| `Payment.Charged` | `(payment_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_charge` (guard)<br>3. Set `payment_id`<br>4. Fire `Order.Created` |
+| `Payment.Authorized` | `(payment_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = authorized WHERE status = pending_authorization` (guard)<br>3. Set `payment_id`<br>4. Call `authorize-slot` (sync — `authorized_count++`; deal may flip `succeeded` here)<br>5a. Slot claimed → fire `Order.Authorized`<br>5b. Slot rejected (deal already resolved before this call landed — **late authorization**) → `UPDATE status = pending_void WHERE status = authorized` (guard), `cancel_reason = deal_resolved`, call `release-slot` (not `release-authorized-slot` — Deal Service never counted this slot), fire `Payment.SettlementRequired.Void`; `Order.Authorized` is **not** fired |
+| `Payment.Captured` | `(payment_id, order_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = confirmed WHERE status = pending_capture` (guard)<br>3. Set `payment_id` — no card-snapshot re-fetch, same reasoning as above<br>4. Fire `Order.Created` |
+| `Payment.Voided` | `(order_id, payment_id, amount)` | 1. Get order by `order_id`<br>2. `UPDATE status = cancelled WHERE status = pending_void` (guard), `cancel_reason` = `deal_failed`, `participant_left`, or `deal_resolved` depending on which path parked the order<br>3. Set `payment_id` — no card-snapshot re-fetch<br>4. Leave path only: call `release-authorized-slot` (sync — `reserved_stock--` and `authorized_count--` atomically; order had reached `authorized` before parking)<br>5. Fire `Order.DealCancelled` |
+
+No sweep re-publishes `Payment.SettlementRequired.Capture`/`Void` for orders stuck in
+`pending_capture`/`pending_void` (the settlement sweeper was removed — see §6). Resolution
+of those two states depends entirely on Payment Service eventually delivering
+`Payment.Captured`/`Payment.Voided` on its own.
 
 ### 4.5 Participation Service
 
@@ -331,11 +377,11 @@ Published events are on `order.lifecycle` topic.
 
 | Published Event | Payload |
 |---|---|
-| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason)` |
+| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price)` |
 
 | Received Event | Payload | Reaction |
 |---|---|---|
-| `Participant.Joined` | `(participant_id, deal_id, user_id, product_id, price, payment_method_id)` | 1. Create order row, `status = pending_authorization` (+ `order_products` row); `payment_intent_id` is **not** set here — it's only known once Payment Service resolves the authorization and Order Service consumes the resulting `Payment.Authorized`/`Payment.Failed` event<br>2. Fire `Payment.InitRequired.Authorize(user_id, order_id, amount, payment_method_id)` |
+| `Participant.Joined` | `(participant_id, deal_id, user_id, product_id, price, payment_method_id, address)` | 1. Synchronously call `GET /api/users/{user_id}/payment-methods/{payment_method_id}` on Payment Service and capture the card snapshot (`card_last4`/`card_brand`/`card_exp_month`/`card_exp_year`) — failure aborts the whole handler, no order row is created, message is redelivered<br>2. Create order row, `status = pending_authorization` (+ `order_products` row), with the card snapshot set from step 1 and `address` from the event (`''` if absent — Participation Service doesn't send it yet)<br>3. Fire `Payment.InitRequired.Authorize(user_id, order_id, amount, payment_method_id)` |
 | `Participant.Left` | `(participant_id, deal_id)` | 1. Find existing order `WHERE deal_id = ? AND participant_id = ? AND status = authorized` — no new row created<br>2. `UPDATE status = pending_void WHERE status = authorized` (guard — parks the order so deal-resolution batches skip it)<br>3. Fire `Payment.SettlementRequired.Void(order_id, payment_id)` |
 
 ### 4.6 Notification Service
@@ -344,10 +390,10 @@ Published events are on `order.lifecycle` topic.
 
 | Published Event | Payload |
 |---|---|
-| `Order.Created` | `{order_id, user_id, items}` |
-| `Order.Authorized` | `{deal_id, user_id}` |
-| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, [{product_id, quantity}])` |
-| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason)` |
+| `Order.Created` | `{order_id, user_id, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, address}` |
+| `Order.Authorized` | `{order_id, deal_id, user_id, total_price}` |
+| `Order.NormalCancelled` | `(order_id, user_id, cancelReason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price, payment_error_message)` |
+| `Order.DealCancelled` | `(order_id, deal_id, participant_id, user_id, reason, items: [{product_id, product_name, product_image_url, quantity, unit_price}], total_price)` |
 
 ---
 
@@ -359,13 +405,16 @@ Published events are on `order.lifecycle` topic.
 
 2. **Catalog lookup.** `POST /products/lookup` with all merged `productIds` in one call.
     - Any `notFound` → `400`. No order row, no reservation, no charge event.
-    - `found` entries give the authoritative `unitPrice` per line item (never trust a
+    - `found` entries give the authoritative `price` per line item (never trust a
       client-supplied price).
     - Catalog Service unreachable → `503`, order row never created.
 
-3. **Create order.** One DB transaction: insert `orders`
-   (`status='reserving'`, `order_type='NORMAL'`, `total_price = Σ(unitPrice × qty)`)
-    + one `order_products` row per merged item (prices from step 2).
+3. **Create order.** Synchronously call `GET /api/users/{user_id}/payment-methods/{payment_method_id}`
+   on Payment Service and capture the card snapshot (`card_last4`/`card_brand`/`card_exp_month`/
+   `card_exp_year`) — failure aborts checkout entirely, no order row created. One DB
+   transaction: insert `orders` (`status='reserving'`, `order_type='NORMAL'`,
+   `total_price = Σ(unitPrice × qty)`, `address` from the request (required, `@NotNull`),
+   card snapshot from above) + one `order_products` row per merged item (prices from step 2).
 
 4. **Inventory reservation.** Single batch call: `POST /inventory/order-reserve` with the
    `orderId` from step 3 and every merged line item (`{productId, quantity}`) in one
@@ -385,8 +434,8 @@ Published events are on `order.lifecycle` topic.
 5. **Charge.** `UPDATE orders SET status='pending_charge' WHERE id=? AND status='reserving'`,
    write `Payment.InitRequired.Charge` to the outbox (`{user_id, order_id, amount,
    payment_method_id}`), commit. Order Service never calls
-   Payment Service directly — Payment Service consumes this event, charges the card, and
-   publishes `Payment.Charged` or `Payment.Failed` asynchronously.
+   Payment Service directly to *initiate* the charge — Payment Service consumes this event,
+   charges the card, and publishes `Payment.Charged` or `Payment.Failed` asynchronously.
     - If Order Service's own consumer resolves the order within a short in-request wait
       → return `201` (confirmed) or `402` (declined) synchronously.
     - Otherwise → leave the order as `pending_charge`. Do not cancel/release yet — the
@@ -400,9 +449,12 @@ Resolution is either an inbound event or a sweep-fired outbound event.
   WHERE id=? AND status='pending_charge'`; if the update affected a row, fire `Order.Created`.
 - **Case 2 — `Payment.Failed`:** `UPDATE orders SET status='cancelled',
   cancel_reason='payment_declined' WHERE id=? AND status='pending_charge'`; if the update
-  affected a row, fire `Order.NormalCancelled` (`{order_id, user_id, cancelReason,
-  [{product_id, quantity}]}`). Inventory Service reacts the same way it reacts to every
-  other `Order.NormalCancelled` (§4.2) — Order Service doesn't call `order-release` itself.
+  affected a row, set `payment_id`, `payment_error_code`, `payment_error_message`, then fire
+  `Order.NormalCancelled` (`{order_id, user_id, cancelReason, items: [{product_id, product_name,
+  product_image_url, quantity, unit_price}], total_price, payment_error_message}`). Inventory
+  Service reacts the same way it reacts
+  to every other `Order.NormalCancelled` (§4.2) — Order Service doesn't call `order-release`
+  itself.
 
 **Reconciliation sweep**, every ~30s:
 - Orders in `pending_charge` past 5 min → fire `Payment.Timeout`.
@@ -412,21 +464,25 @@ Resolution is either an inbound event or a sweep-fired outbound event.
 
 ## 6. Deal Order Flow
 
-1. **Join.** Consuming `Participant.Joined`: insert `orders` (`status='pending_authorization'`,
-   `order_type='DEAL'`, `deal_id`, `participant_id` from the event) + one `order_products`
-   row (`quantity=1`, `unit_price` = event's `price`). `payment_method_id` comes from the
-   event; `payment_intent_id` is left unset at this point — it's only known once Payment
-   Service resolves the authorization and Order Service consumes the resulting
-   `Payment.Authorized`/`Payment.Failed` event. Write `Payment.InitRequired.Authorize`
-   (`{user_id, order_id, amount, payment_method_id}`) to the outbox and commit. No
-   synchronous call to Payment Service — it consumes this event, authorizes the hold, and
-   publishes `Payment.Authorized` or `Payment.Failed` asynchronously.
+1. **Join.** Consuming `Participant.Joined`: synchronously call
+   `GET /api/users/{user_id}/payment-methods/{payment_method_id}` on Payment Service (using
+   `payment_method_id` from the event) and capture the card snapshot (`card_last4`/
+   `card_brand`/`card_exp_month`/`card_exp_year`) — failure aborts the handler entirely, no
+   order row is created and the inbound message is redelivered. Insert `orders`
+   (`status='pending_authorization'`, `order_type='DEAL'`, `deal_id`, `participant_id` from
+   the event, `address` from the event's `address` field, card snapshot from
+   above) + one `order_products` row (`quantity=1`,
+   `unit_price` = event's `price`). Write `Payment.InitRequired.Authorize`
+   (`{user_id, order_id, amount, payment_method_id}`) to the outbox and commit. No further
+   synchronous call to Payment Service after this step — it consumes this event, authorizes
+   the hold, and publishes `Payment.Authorized` or `Payment.Failed` asynchronously.
 
 2. **Authorization resolves.**
     - **`Payment.Authorized` consumed:** `UPDATE orders SET status='authorized', payment_id=?
-     WHERE id=? AND status='pending_authorization'` (guard). Call `authorize-slot` on Deal
-      Service synchronously (`authorized_count++`; this call may flip the deal to `succeeded`
-      on Deal Service's side).
+     WHERE id=? AND status='pending_authorization'` (guard). No card-snapshot fetch here — it
+      was already captured at join time (step 1). Call `authorize-slot` on Deal Service
+      synchronously (`authorized_count++`; this call may flip the deal to `succeeded` on Deal
+      Service's side).
         - Slot claimed → fire `Order.Authorized`.
         - Slot rejected (**late authorization** — the deal already resolved before this call
           landed) → `UPDATE orders SET status='pending_void', cancel_reason='deal_resolved'
@@ -435,8 +491,9 @@ Resolution is either an inbound event or a sweep-fired outbound event.
           fire `Payment.SettlementRequired.Void`. `Order.Authorized` is not fired.
     - **`Payment.Failed` consumed:** `UPDATE orders SET status='cancelled',
      cancel_reason='payment_declined' WHERE id=? AND status='pending_authorization'` (guard).
-      Call `release-slot` (`reserved_stock--`; the order never reached `authorized`, so
-      `authorized_count` is untouched). Fire `Order.DealCancelled`.
+      Set `payment_id` — no card-snapshot fetch, same reasoning as above. Call `release-slot`
+      (`reserved_stock--`; the order never reached `authorized`, so `authorized_count` is
+      untouched). Fire `Order.DealCancelled`.
 
 3. **Deal resolves.** Deal Service batches over every order still `authorized` for a
    `deal_id`: `SELECT ... WHERE deal_id = ? AND status = 'authorized'`, then per order a
@@ -465,14 +522,11 @@ Resolution is either an inbound event or a sweep-fired outbound event.
       `release-slot` case used for `deal_resolved`/`Payment.Failed`). Fire
       `Order.DealCancelled`.
 
-**Reconciliation sweep**, every ~30s, thresholds are 60s (vs. 5 min/2 sec for NORMAL —
-deals settle on a much tighter clock):
+**Reconciliation sweep**, every ~30s, threshold is 60s for `pending_authorization` (vs. 5
+min/2 sec for NORMAL — deals settle on a much tighter clock):
 - Orders in `pending_authorization` past 60s → **force-cancel**: `UPDATE status='cancelled',
   cancel_reason='payment_timeout' WHERE status='pending_authorization'` (guard), call
   `release-slot`, fire `Order.DealCancelled` and `Payment.Timeout` (`{order_id}`).
-- Orders in `pending_capture` or `pending_void` past 60s → **re-publish**, never cancel:
-  re-fire the same `Payment.SettlementRequired.Capture`/`Void`.
-
 ---
 
 ## Appendix: SQL Schema
@@ -487,42 +541,48 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- =====================================================================
 
 CREATE TABLE orders (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id           UUID NOT NULL,
-    order_type        VARCHAR(10) NOT NULL CHECK (order_type IN ('NORMAL', 'DEAL')),
+                        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        user_id           UUID NOT NULL,
+                        order_type        VARCHAR(10) NOT NULL CHECK (order_type IN ('NORMAL', 'DEAL')),
 
-    deal_id           UUID NULL,               -- required if order_type = 'DEAL'
-    participant_id    UUID NULL,               -- required if order_type = 'DEAL'
+                        deal_id           UUID NULL,               -- required if order_type = 'DEAL'
+                        participant_id    UUID NULL,               -- required if order_type = 'DEAL'
 
-    status            VARCHAR(50) NOT NULL CHECK (status IN (
-                          'RESERVING',
-                          'PENDING_CHARGE',
-                          'PENDING_AUTHORIZATION',
-                          'AUTHORIZED',
-                          'PENDING_CAPTURE',
-                          'PENDING_VOID',
-                          'CONFIRMED',
-                          'CANCELLED'
-                      )),
+                        status            VARCHAR(50) NOT NULL CHECK (status IN (
+                                                                                 'RESERVING',
+                                                                                 'PENDING_CHARGE',
+                                                                                 'PENDING_AUTHORIZATION',
+                                                                                 'AUTHORIZED',
+                                                                                 'PENDING_CAPTURE',
+                                                                                 'PENDING_VOID',
+                                                                                 'CONFIRMED',
+                                                                                 'CANCELLED'
+                            )),
 
-    total_price       NUMERIC(10,2) NOT NULL CHECK (total_price >= 0),
-    payment_id        UUID NULL,               -- set once Payment Service returns a payment_id
-    payment_intent_id VARCHAR(255) NULL,
-    cancel_reason     VARCHAR(30) NULL CHECK (cancel_reason IN (
-                          'INSUFFICIENT_STOCK', 'INVENTORY_UNREACHABLE', 'RESERVATION_INCOMPLETE',
-                          'PAYMENT_DECLINED', 'PAYMENT_TIMEOUT', 'DEAL_FAILED', 'DEAL_RESOLVED',
-                          'PARTICIPANT_LEFT'
-                      )),
+                        total_price       NUMERIC(10,2) NOT NULL CHECK (total_price >= 0),
+                        address           TEXT NOT NULL, 
+                        payment_id        UUID NULL,               
+                        card_last4        VARCHAR(4) NULL,        
+                        card_brand        VARCHAR(20) NULL,
+                        card_exp_month    VARCHAR(2) NULL,          
+                        card_exp_year     VARCHAR(4) NULL,          
+                        cancel_reason     VARCHAR(30) NULL CHECK (cancel_reason IN (
+                                                                                    'INSUFFICIENT_STOCK', 'INVENTORY_UNREACHABLE', 'RESERVATION_INCOMPLETE',
+                                                                                    'PAYMENT_DECLINED', 'PAYMENT_TIMEOUT', 'DEAL_FAILED', 'DEAL_RESOLVED',
+                                                                                    'PARTICIPANT_LEFT'
+                            )),
+                        payment_error_code    VARCHAR(50) NULL,    
+                        payment_error_message TEXT NULL,            
 
-    version           INT NOT NULL DEFAULT 0,  -- optimistic locking / race auditing
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    status_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),   -- V5; last time `status` changed
+                        version           INT NOT NULL DEFAULT 0,  
+                        created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        status_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),  
 
-    CONSTRAINT deal_fields_consistency CHECK (
-        (order_type = 'DEAL'   AND deal_id IS NOT NULL AND participant_id IS NOT NULL) OR
-        (order_type = 'NORMAL' AND deal_id IS NULL AND participant_id IS NULL)
-    )
+                        CONSTRAINT deal_fields_consistency CHECK (
+                            (order_type = 'DEAL'   AND deal_id IS NOT NULL AND participant_id IS NOT NULL) OR
+                            (order_type = 'NORMAL' AND deal_id IS NULL AND participant_id IS NULL)
+                            )
 );
 
 -- Guards against a redelivered participant.Joined creating two orders for the same slot.
@@ -542,7 +602,7 @@ CREATE INDEX idx_orders_status_status_updated_at ON orders (status, status_updat
 -- Keeps updated_at accurate automatically so sweep jobs don't depend on
 -- application code remembering to set it on every status change.
 CREATE OR REPLACE FUNCTION set_updated_at()
-RETURNS TRIGGER AS $$
+    RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = now();
     RETURN NEW;
@@ -552,11 +612,11 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_orders_updated_at
     BEFORE UPDATE ON orders
     FOR EACH ROW
-    EXECUTE FUNCTION set_updated_at();
+EXECUTE FUNCTION set_updated_at();
 
 
 CREATE OR REPLACE FUNCTION set_status_updated_at()
-RETURNS TRIGGER AS $$
+    RETURNS TRIGGER AS $$
 BEGIN
     IF NEW.status IS DISTINCT FROM OLD.status THEN
         NEW.status_updated_at = now();
@@ -568,19 +628,21 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_orders_status_updated_at
     BEFORE UPDATE ON orders
     FOR EACH ROW
-    EXECUTE FUNCTION set_status_updated_at();
+EXECUTE FUNCTION set_status_updated_at();
 
 -- =====================================================================
 -- order_products
 -- =====================================================================
 
 CREATE TABLE order_products (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    order_id    UUID NOT NULL REFERENCES orders(id),
-    product_id  UUID NOT NULL,
-    quantity    INT NOT NULL CHECK (quantity > 0),   -- always 1 for DEAL, can be >1 for NORMAL
-    unit_price  NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                                id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                                order_id           UUID NOT NULL REFERENCES orders(id),
+                                product_id         UUID NOT NULL,
+                                quantity           INT NOT NULL CHECK (quantity > 0),   -- always 1 for DEAL, can be >1 for NORMAL
+                                unit_price         NUMERIC(10,2) NOT NULL CHECK (unit_price >= 0),
+                                product_name       VARCHAR(255) NULL,    
+                                product_image_url VARCHAR(1000) NULL,     
+                                created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX idx_order_products_order_id ON order_products (order_id);
@@ -594,20 +656,20 @@ CREATE INDEX idx_order_products_order_id ON order_products (order_id);
 -- =====================================================================
 
 CREATE TABLE outbox_events (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_id    UUID NOT NULL,             -- VARCHAR(100) in V3, restored to UUID in V7
-    event_type      VARCHAR(100) NOT NULL,     -- widened from VARCHAR(50) in V3
-    payload         JSONB NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at    TIMESTAMPTZ NULL,
-    aggregate_type  VARCHAR(50),               -- added V3
-    topic           VARCHAR(100),              -- added V3
-    status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- added V3
-    attempts        INT NOT NULL DEFAULT 0,    -- added V3
-    last_error      TEXT,                      -- added V3
-    correlation_id  UUID NOT NULL,             -- added V6
-    causation_id    UUID NOT NULL,             -- added V8
-    trace_id        UUID NOT NULL              -- added V8
+                               id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                               aggregate_id    UUID NOT NULL,             -- VARCHAR(100) in V3, restored to UUID in V7
+                               event_type      VARCHAR(100) NOT NULL,     -- widened from VARCHAR(50) in V3
+                               payload         JSONB NOT NULL,
+                               created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                               published_at    TIMESTAMPTZ NULL,
+                               aggregate_type  VARCHAR(50),               -- added V3
+                               topic           VARCHAR(100),              -- added V3
+                               status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',  -- added V3
+                               attempts        INT NOT NULL DEFAULT 0,    -- added V3
+                               last_error      TEXT,                      -- added V3
+                               correlation_id  UUID NOT NULL,             -- added V6
+                               causation_id    UUID NOT NULL,             -- added V8
+                               trace_id        UUID NOT NULL              -- added V8
 );
 
 CREATE INDEX idx_outbox_events_pending ON outbox_events (created_at) WHERE status = 'PENDING';
@@ -621,10 +683,10 @@ CREATE INDEX idx_outbox_events_correlation_id ON outbox_events (correlation_id);
 -- =====================================================================
 
 CREATE TABLE processed_events (
-    event_id      VARCHAR(100) NOT NULL,   -- was UUID, retyped in V3
-    event_type    VARCHAR(100) NOT NULL,   -- widened from VARCHAR(50) in V3
-    processed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    source_topic  VARCHAR(100),            -- added V3
-    PRIMARY KEY (event_id, source_topic)   -- old single-column PK (event_id) dropped in V3
+                                  event_id      VARCHAR(100) NOT NULL,   -- was UUID, retyped in V3
+                                  event_type    VARCHAR(100) NOT NULL,   -- widened from VARCHAR(50) in V3
+                                  processed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                                  source_topic  VARCHAR(100),            -- added V3
+                                  PRIMARY KEY (event_id, source_topic)   -- old single-column PK (event_id) dropped in V3
 );
 ```
