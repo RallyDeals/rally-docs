@@ -405,8 +405,11 @@ Published events are on `order.lifecycle` topic.
 
 2. **Catalog lookup.** `POST /products/lookup` with all merged `productIds` in one call.
     - Any `notFound` → `400`. No order row, no reservation, no charge event.
-    - `found` entries give the authoritative `price` per line item (never trust a
-      client-supplied price).
+    - `found` is a map keyed by product ID; each entry is
+      `{ "id", "name", "imageUrl", "basePrice" }`. `basePrice` is the authoritative price per
+      line item (never trust a client-supplied price); `name` and `imageUrl` are captured into
+      the order-product snapshot. The client must deserialize `found` into `Map<UUID, ...>`
+      (product IDs are UUID-formatted strings).
     - Catalog Service unreachable → `503`, order row never created.
 
 3. **Create order.** Synchronously call `GET /api/users/{user_id}/payment-methods/{payment_method_id}`
