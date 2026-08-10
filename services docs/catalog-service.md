@@ -340,18 +340,19 @@ Soft-deletes a product (sets `deleted_at`).
 
 ```json
 {
-  "found": [
-    {
+  "found": {
+    "uuid": {
       "id": "uuid",
+      "name": "Wireless Earbuds",
       "basePrice": 39.99,
       "imageUrl": "https://cdn.example.com/img1.jpg"
     }
-  ],
+  },
   "notFound": ["uuid"]
 }
 ```
 
-Only returns approved, non-deleted products. Any `productId` not matching an approved product is returned in `notFound`.
+`found` is a map keyed by product ID; each item includes `name`, `basePrice`, and `imageUrl` so Order Service can snapshot the product into the order. Only returns approved, non-deleted products. Any `productId` not matching an approved product is returned in `notFound`.
 
 **Errors**
 | Status | Cause |

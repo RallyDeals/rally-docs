@@ -303,7 +303,7 @@ A cancelled order (e.g. a card decline) additionally populates `cancelReason`,
 
 | Request Endpoint | Request Body | Response Body |
 |---|---|---|
-| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": { "8a2c...": { "productId": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "price": 39.99 } }, "notFound": ["c091..."] }` |
+| `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": { "8a2c...": { "id": "8a2c...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "basePrice": 39.99 } }, "notFound": ["c091..."] }` |
 
 ### 4.2 Inventory Service
 
