@@ -171,13 +171,19 @@ The only cross-service contract is the internal lookup endpoint (§5.6) called b
   "sellerId": "uuid",
   "name": "Wireless Headphones",
   "description": "Noise-cancelling Bluetooth headphones",
-  "categoryId": "uuid",
+  "category": { "id": "uuid", "name": "Electronics", "description": "Gadgets, devices, and accessories", "createdAt": "2026-07-28T09:00:00Z" },
   "basePrice": 79.99,
   "imageUrl": "https://cdn.example.com/img1.jpg",
   "status": "PENDING_APPROVAL",
-  "createdAt": "2026-07-28T10:15:00Z"
+  "rejectionReason": null,
+  "createdAt": "2026-07-28T10:15:00Z",
+  "updatedAt": "2026-07-28T10:15:00Z"
 }
 ```
+
+> **Note (spec aligned with implementation):** the response embeds the full
+> `category` object (`{id, name, description, createdAt}`) — not a flat `categoryId`.
+> It also carries `rejectionReason` and `updatedAt`.
 
 **Errors**
 | Status | Cause |
@@ -207,16 +213,19 @@ Returns only `APPROVED` and non-deleted products.
 
 ```json
 {
-  "products": [
+  "items": [
     {
       "id": "uuid",
+      "sellerId": "uuid",
       "name": "Wireless Headphones",
       "description": "Noise-cancelling Bluetooth headphones",
-      "category": { "id": "uuid", "name": "Electronics" },
-      "sellerId": "uuid",
+      "category": { "id": "uuid", "name": "Electronics", "description": "Gadgets, devices, and accessories", "createdAt": "2026-07-28T09:00:00Z" },
       "basePrice": 79.99,
       "imageUrl": "https://cdn.example.com/img1.jpg",
-      "createdAt": "2026-07-28T10:15:00Z"
+      "status": "APPROVED",
+      "rejectionReason": null,
+      "createdAt": "2026-07-28T10:15:00Z",
+      "updatedAt": "2026-07-28T10:20:00Z"
     }
   ],
   "page": 1,
@@ -224,6 +233,9 @@ Returns only `APPROVED` and non-deleted products.
   "total": 1
 }
 ```
+
+> **Note (spec aligned with implementation):** the envelope key is `items`, not
+> `products`. Items are full `ProductResponse` objects (same shape as §5.3).
 
 **Errors**
 | Status | Cause |
@@ -242,10 +254,11 @@ Returns only `APPROVED` and non-deleted products.
   "sellerId": "uuid",
   "name": "Wireless Headphones",
   "description": "Noise-cancelling Bluetooth headphones",
-  "category": { "id": "uuid", "name": "Electronics" },
+  "category": { "id": "uuid", "name": "Electronics", "description": "Gadgets, devices, and accessories", "createdAt": "2026-07-28T09:00:00Z" },
   "basePrice": 79.99,
   "imageUrl": "https://cdn.example.com/img1.jpg",
   "status": "APPROVED",
+  "rejectionReason": null,
   "createdAt": "2026-07-28T10:15:00Z",
   "updatedAt": "2026-07-28T10:20:00Z"
 }
@@ -305,6 +318,10 @@ Soft-deletes a product (sets `deleted_at`).
 | 409 | product is tied to an active deal — deletion rejected |
 | 410 | product is already deleted |
 
+> **Status of the 409:** NOT yet enforced. Currently the service soft-deletes regardless
+> of any active deal. It requires the **Deal Service contract** described in §10
+> (blocked until Deal Service exists).
+
 ---
 
 ### 5.6 `POST /products/lookup` — Internal bulk lookup
@@ -323,18 +340,19 @@ Soft-deletes a product (sets `deleted_at`).
 
 ```json
 {
-  "found": [
-    {
+  "found": {
+    "uuid": {
       "id": "uuid",
+      "name": "Wireless Earbuds",
       "basePrice": 39.99,
       "imageUrl": "https://cdn.example.com/img1.jpg"
     }
-  ],
+  },
   "notFound": ["uuid"]
 }
 ```
 
-Only returns approved, non-deleted products. Any `productId` not matching an approved product is returned in `notFound`.
+`found` is a map keyed by product ID; each item includes `name`, `basePrice`, and `imageUrl` so Order Service can snapshot the product into the order. Only returns approved, non-deleted products. Any `productId` not matching an approved product is returned in `notFound`.
 
 **Errors**
 | Status | Cause |
@@ -344,7 +362,7 @@ Only returns approved, non-deleted products. Any `productId` not matching an app
 
 ---
 
-### 5.7 `GET /sellers/{id}/products` — Seller's own products
+### 5.7 `GET /products/sellers/{sellerId}` — Seller's own products
 
 Returns all products owned by the seller, regardless of status (including rejected, pending, and soft-deleted).
 
@@ -353,6 +371,7 @@ Returns all products owned by the seller, regardless of status (including reject
 |---|---|---|---|
 | `status` | string | no | Filter by moderation status: `PENDING_APPROVAL` \| `APPROVED` \| `REJECTED` |
 | `includeDeleted` | bool | no | Default `false` |
+| `sort` | string | no | Sort field and direction — see §7 |
 | `page` | int | no | Default `1` |
 | `limit` | int | no | Default `20`, max `100` |
 
@@ -361,13 +380,18 @@ Returns all products owned by the seller, regardless of status (including reject
 **Errors**
 | Status | Cause |
 |---|---|
-| 403 | caller is not `{id}` |
+| 403 | caller is not `{sellerId}` — enforced service-side (deferred until Auth exists, §10.2) |
 
 ---
 
 ### 5.8 Admin Endpoints
 
-#### `GET /admin/products` — Admin views all products
+> **Note (spec aligned with implementation):** admin routes live under `/products/admin/...`
+> (not `/admin/products/...`). `ADMIN` role enforcement is done by the **service itself**
+> via `AdminRoleFilter` (reads `X-User-Role` header injected by the gateway). The filter is
+> **currently disabled** — see §10.2.
+
+#### `GET /products/admin` — Admin views all products
 
 Returns all products regardless of status, including soft-deleted.
 
@@ -383,7 +407,7 @@ Returns all products regardless of status, including soft-deleted.
 
 ---
 
-#### `PATCH /admin/products/{id}/approve` — Admin approves a product
+#### `PATCH /products/admin/{id}/approve` — Admin approves a product
 
 Transitions `PENDING_APPROVAL → APPROVED`.
 
@@ -404,7 +428,7 @@ Transitions `PENDING_APPROVAL → APPROVED`.
 
 ---
 
-#### `PATCH /admin/products/{id}/reject` — Admin rejects a product
+#### `PATCH /products/admin/{id}/reject` — Admin rejects a product
 
 Transitions `PENDING_APPROVAL → REJECTED`.
 
@@ -473,10 +497,12 @@ Returns all categories (no pagination needed — bounded set).
 **Response — 200**
 
 ```json
-{
-  "categories": [{ "id": "uuid", "name": "Electronics", "description": "..." }]
-}
+[
+  { "id": "uuid", "name": "Electronics", "description": "Gadgets, devices, and accessories" }
+]
 ```
+
+> **Note (spec aligned with implementation):** returns a bare array — no `categories` envelope.
 
 ---
 
@@ -513,18 +539,18 @@ Seller creates product
 
 The `GET /products` endpoint supports full-text search and fixed filter params (consistent with the hardcoded-param style used across other services).
 
-### 7.1 Full-Text Search
+### 7.1 Search (`q`)
 
-```
-GET /products?q=wireless+headphones
-```
+**Current implementation (spec aligned with code):** `q` is matched with a
+case-insensitive `LIKE '%q%'` on `name` and `description` via JPA Criteria
+(`lower(name) LIKE %q% OR lower(description) LIKE %q%`). Portable across databases, no
+raw SQL, but substring-based — `"run"` does **not** match `"running"`.
 
-```sql
-WHERE to_tsvector('english', name || ' ' || description)
-      @@ plainto_tsquery('english', :q)
-```
-
-Matches word stems: `"running"` also matches `"run"`, `"runner"`.
+> **Optional future enhancement:** switch to PostgreSQL full-text search
+> (`to_tsvector('english', name || ' ' || description) @@ plainto_tsquery('english', :q)`)
+> so `"run"` matches `"run"`/`"running"`/`"runner"`. The `idx_products_fts` GIN index
+> already exists in the schema (§1) and is currently unused. If implemented, register a
+> custom Hibernate SQL function for the `@@` operator rather than reverting to raw SQL.
 
 ### 7.2 Fixed Filter Params
 
@@ -604,3 +630,43 @@ The catalog service does **not** own:
 - inventory stock levels or reservation
 - order state or payment processing
 - user authentication or authorization (relies on API Gateway for JWT validation)
+
+---
+
+## 10. Cross-Service Contracts Catalog Needs (deferred)
+
+### 10.1 Deal Service contract — reject deleting a product with an active deal
+
+`DELETE /products/{id}` must return **409 Conflict** when the product is tied to an
+active deal. Catalog does not own deal state, so it cannot decide this on its own.
+
+**What Deal Service must provide (choose one):**
+
+- **Sync endpoint (recommended):** `GET /internal/deals?productId={id}&active=true` →
+  `200 { "hasActiveDeal": true|false }`, or an `exists`-style internal endpoint. Called
+  by Catalog Service inside `deleteProduct` before soft-deleting.
+- **Async alternative:** Deal Service publishes a `deal.created` / `deal.succeeded` /
+  `deal.cancelled` / `deal.failed` event; Catalog keeps a local `product_deal_refs`
+  table (product_id + deal_status) to answer "has an active deal?" without a sync call.
+
+**Contract note:** `active` means the deal is in `pending` or `active` state (not yet
+`succeeded`/`failed`/`cancelled`). Exact state set to be confirmed when Deal Service's
+state machine is implemented (`rally-docs/services docs/deal-service.md`).
+
+### 10.2 Role enforcement — service-side filter (deferred)
+
+Catalog does its **own** role filtering; it does not depend on the API Gateway for
+authorization logic.
+
+- **Implementation:** `AdminRoleFilter` (`com.rally.catalog.config`) — a servlet filter
+  matching `/products/admin/*` that requires the `X-User-Role` header to be `ADMIN`
+  (403 `UnauthorizedException` otherwise).
+- **Status: DISABLED.** The filter is written but NOT registered (`@Component` on the
+  class and the `adminRoleFilter()` bean in `SecurityConfig` are commented out).
+- **Blocking dependency:** the Auth service. `X-User-Role` is only trustworthy once a JWT
+  is validated and the header is injected by an authenticated caller. Until Auth exists,
+  headers can be forged, so the check stays off to keep endpoints testable.
+- **Also deferred to the same filter/flow:** `SELLER` ownership on
+  `PATCH`/`DELETE /products/{id}` and `GET /products/sellers/{sellerId}` (currently the
+  ownership checks run in `ProductService` using the `X-User-Id` header).
+

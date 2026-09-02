@@ -498,13 +498,6 @@ Same auth rules and `orderType = NORMAL` restriction as §3.5.
 |---|---|---|
 | `POST /products/lookup` | `{ "productIds": ["8a2c...", "c091..."] }` | `{ "found": { "8a2c...": { "id": "8a2c...", "sellerId": "d7e1...", "name": "Wireless Mouse", "imageUrl": "https://cdn.../mouse.jpg", "basePrice": 39.99 } }, "notFound": ["c091..."] }` |
 
-`sellerId` on each returned product is what populates `order_products.seller_id` (§1, V17) for
-both flows — NORMAL checkout always calls this synchronously and aborts checkout on failure
-(§5 step 2); the DEAL join path (§6 step 1) also calls it, but **swallows any failure** and
-proceeds with `sellerId`/`productName`/`productImageUrl` left `null` on that line item rather than
-failing the join — this is the other half of why deal order_products can lack `seller_id` even
-though the lookup is attempted.
-
 ### 4.2 Inventory Service
 
 Published events are on `order.lifecycle_events` topic.
