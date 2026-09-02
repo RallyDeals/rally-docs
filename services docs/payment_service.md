@@ -7,7 +7,7 @@ It focuses on the broker-driven payment flow:
 - Order Service publishes payment requests.
 - Payment Service consumes those requests.
 - Payment Service persists state in PostgreSQL.
-- Payment Service uses inbox/outbox tables for reliability.
+- Payment Service uses outbox tables for reliability.
 - Payment Service publishes payment outcome events back to Kafka.
 
 The selected integration model is:
@@ -28,7 +28,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- =====================================================================
 
 CREATE TABLE payment_methods (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id               UUID NOT NULL PRIMARY KEY,
     user_id          UUID NOT NULL,
     type             VARCHAR(50) NOT NULL,     -- CARD, WALLET, etc.
     token            VARCHAR(500) NOT NULL,    -- Stripe payment method id or vault token
@@ -37,16 +37,11 @@ CREATE TABLE payment_methods (
     card_last4       VARCHAR(4),
     card_exp_month   VARCHAR(2),
     card_exp_year    VARCHAR(4),
-    version          BIGINT NOT NULL DEFAULT 0,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    card_fingerprint VARCHAR(255),
+    version          BIGINT NOT NULL DEFAULT 0
 );
 
 CREATE INDEX idx_payment_methods_user_id ON payment_methods (user_id);
-
--- Optional but recommended if a token must not be duplicated per user.
-CREATE UNIQUE INDEX uq_payment_methods_user_token
-    ON payment_methods (user_id, token);
 
 -- Only one default payment method per user.
 CREATE UNIQUE INDEX uq_payment_methods_one_default_per_user
@@ -58,13 +53,12 @@ CREATE UNIQUE INDEX uq_payment_methods_one_default_per_user
 -- =====================================================================
 
 CREATE TABLE payments (
-    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                 UUID NOT NULL PRIMARY KEY,
     user_id            UUID NOT NULL,
     order_id           UUID NOT NULL,
-    payment_method_id  UUID NOT NULL REFERENCES payment_methods(id),
+    payment_method_id  UUID REFERENCES payment_methods(id) ON DELETE SET NULL,
     payment_intent_id  VARCHAR(255),
-    stripe_customer_id VARCHAR(255),
-    amount             NUMERIC(18,2) NOT NULL CHECK (amount >= 0),
+    amount             NUMERIC(18,2) NOT NULL,
     status             VARCHAR(50) NOT NULL,
     failure_reason     VARCHAR(500),
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -73,7 +67,6 @@ CREATE TABLE payments (
     charged_at         TIMESTAMPTZ,
     failed_at          TIMESTAMPTZ,
     voided_at          TIMESTAMPTZ,
-    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
     version            BIGINT NOT NULL DEFAULT 0
 );
 
@@ -82,36 +75,6 @@ CREATE INDEX idx_payments_user_id ON payments (user_id);
 CREATE INDEX idx_payments_payment_method_id ON payments (payment_method_id);
 CREATE INDEX idx_payments_payment_intent_id ON payments (payment_intent_id);
 CREATE INDEX idx_payments_status ON payments (status);
-
--- =====================================================================
--- inbox_messages
--- =====================================================================
-
-CREATE TABLE inbox_messages (
-    message_id      VARCHAR(255) PRIMARY KEY, -- stripe event id or kafka message id
-    topic           VARCHAR(100) NOT NULL,    -- stripe.events / order / etc.
-    message_type    VARCHAR(100) NOT NULL,    -- payment_intent.created / Payment.InitRequired / etc.
-    correlation_id  UUID,
-    causation_id    VARCHAR(255),
-    trace_id        VARCHAR(64),
-    payload         JSONB NOT NULL,
-    headers         JSONB,
-    status          VARCHAR(20) NOT NULL DEFAULT 'RECEIVED',
-    retry_count     INTEGER NOT NULL DEFAULT 0,
-    max_retries     INTEGER NOT NULL DEFAULT 5,
-    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    processed_at    TIMESTAMPTZ,
-    last_error      TEXT
-);
-
-CREATE INDEX idx_inbox_status_received_at
-    ON inbox_messages (status, received_at);
-
-CREATE INDEX idx_inbox_topic
-    ON inbox_messages (topic);
-
-CREATE INDEX idx_inbox_correlation
-    ON inbox_messages (correlation_id);
 
 -- =====================================================================
 -- outbox_messages
@@ -143,11 +106,61 @@ CREATE INDEX idx_outbox_status_created_at
 CREATE INDEX idx_outbox_topic
     ON outbox_messages (topic);
 
-CREATE INDEX idx_outbox_aggregate
+CREATE INDEX idx_outbox_aggregate_id
     ON outbox_messages (aggregate_id);
 
 CREATE INDEX idx_outbox_correlation
     ON outbox_messages (correlation_id);
+
+-- =====================================================================
+-- inbox_messages
+-- =====================================================================
+
+CREATE TABLE inbox_messages (
+    message_id      VARCHAR(255) PRIMARY KEY,
+    topic           VARCHAR(100) NOT NULL,
+    message_type    VARCHAR(100) NOT NULL,
+    correlation_id  UUID,
+    causation_id    VARCHAR(255),
+    trace_id        VARCHAR(64),
+    payload         JSONB NOT NULL,
+    headers         JSONB,
+    status          VARCHAR(20) NOT NULL DEFAULT 'RECEIVED',
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    max_retries     INTEGER NOT NULL DEFAULT 5,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at    TIMESTAMPTZ,
+    last_error      TEXT
+);
+
+CREATE INDEX idx_inbox_status_received_at
+    ON inbox_messages (status, received_at);
+
+CREATE INDEX idx_inbox_processed_at
+    ON inbox_messages (processed_at)
+    WHERE processed_at IS NOT NULL;
+
+CREATE INDEX idx_inbox_topic
+    ON inbox_messages (topic);
+
+CREATE INDEX idx_inbox_correlation
+    ON inbox_messages (correlation_id);
+
+-- =====================================================================
+-- payment_profiles
+-- =====================================================================
+
+CREATE TABLE payment_profiles (
+    id                 UUID PRIMARY KEY,
+    user_id            UUID NOT NULL UNIQUE,
+    stripe_customer_id VARCHAR(255) NOT NULL,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    version            BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_payment_profiles_user_id
+    ON payment_profiles (user_id);
 ```
 
 ---
@@ -181,6 +194,9 @@ Key behaviors:
 - `voidPayment(...)`
 - `fail(...)`
 - `requireAdditionalAction(...)`
+- `linkToStripeCustomer(...)`
+- `linkToStripePaymentIntent(...)`
+- `suppressDomainEvents(...)`
 
 ### 2.2 `PaymentMethod`
 
@@ -193,18 +209,45 @@ Key fields:
 - `type`
 - `token`
 - `isDefault`
+- `cardFingerprint`
 - embedded card metadata
 - `version`
 
-The service stores only non-sensitive metadata such as brand and last four digits.
+The service stores only non-sensitive metadata such as brand, last four digits, and the card fingerprint, plus the Stripe payment method id (`token`).
 
-### 2.3 `InboxMessage`
-
-Stores consumed broker messages for idempotency and retry tracking.
-
-### 2.4 `OutboxMessage`
+### 2.3 `OutboxMessage`
 
 Stores payment outcome events that will later be published to Kafka by the outbox relay.
+
+### 2.4 `InboxMessage`
+
+Stores incoming broker messages for idempotent processing.
+
+Key fields:
+
+- `messageId` — unique message identifier (`X-Id` header value) used for deduplication
+- `topic` — Kafka topic the message was consumed from
+- `messageType` — message type (`X-Type` header value)
+- `correlationId` — links the message to the business flow
+- `causationId` — always null; the payment service neither consumes nor populates a causation id
+- `traceId` — distributed tracing identifier
+- `payload` — the deserialized message payload (JSONB)
+- `headers` — the raw Kafka record headers (JSONB)
+- `status` — `RECEIVED` or `PROCESSED`
+- `receivedAt` / `processedAt` — lifecycle timestamps
+- `retryCount` / `maxRetries` — retry tracking
+- `lastError` — error message if processing failed
+
+### 2.5 `PaymentProfile`
+
+Maps a buyer to their Stripe Customer ID. Created lazily on first payment interaction.
+
+Key fields:
+
+- `id`
+- `userId` — unique; one profile per buyer
+- `stripeCustomerId` — the Stripe Customer object ID (`cus_...`)
+- `version`
 
 ---
 
@@ -224,6 +267,10 @@ stateDiagram-v2
     VOIDED --> [*]
     FAILED --> [*]
     AUTHORIZED --> REQUIRES_ACTION: gateway says 3DS / action needed
+    CHARGED --> REFUNDED: refund.created (full)
+    CHARGED --> PARTIALLY_REFUNDED: refund.created (partial)
+    CAPTURED --> REFUNDED: refund.created (full)
+    CAPTURED --> PARTIALLY_REFUNDED: refund.created (partial)
 ```
 
 Practical meaning:
@@ -235,6 +282,8 @@ Practical meaning:
 - `VOIDED` means a held payment was cancelled before capture.
 - `FAILED` means the payment attempt did not complete successfully.
 - `REQUIRES_ACTION` means customer action is required before completion.
+- `REFUNDED` means a fully refunded (captured or charged) payment.
+- `PARTIALLY_REFUNDED` means a partially refunded (captured or charged) payment.
 
 ---
 
@@ -248,11 +297,10 @@ Every brokered message, whether consumed or published, must include these header
 
 | Header | Required | Purpose |
 |---|---|---|
-| `X-Id` | yes | Unique message identifier used for inbox/outbox dedupe |
+| `X-Id` | yes | Unique message identifier used for message dedupe |
 | `X-Type` | yes | Message type and operation selector |
 | `X-Correlation-Id` | yes | Links the message to the business flow |
-| `X-Causation-Id` | yes | Points to the message that triggered this one |
-| `X-Trace-Id` | yes | Distributed tracing identifier |
+| `traceparent` | no | W3C trace context used for distributed tracing |
 
 The payload must not contain any of those fields.
 
@@ -268,14 +316,15 @@ Recommended `X-Type` values for request messages:
 - `Payment.SettlementRequired.Void`
 - `Payment.Timeout`
 
-Recommended `X-Type` values for outcome messages:
+Recommended `X-Type` values for outcome messages (the ones actually published to `payment.events`):
 
 - `Payment.Authorized`
 - `Payment.Charged`
 - `Payment.Captured`
 - `Payment.Failed`
 - `Payment.Voided`
-- `Payment.RequiresAction`
+
+Note: `Payment.Initialized` and `Payment.Refunded` are raised as internal domain events but are **not** published to Kafka. `Payment.RequiresAction` is mapped to `Payment.Failed` at orchestration time and is not emitted as its own outbox event.
 
 ### 4.2 Order Service -> Payment Service
 
@@ -306,8 +355,7 @@ Headers:
 | `X-Type` | `Payment.InitRequired.Charge` or `Payment.InitRequired.Authorize` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the order event that triggered the request |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -338,8 +386,7 @@ Headers:
 | `X-Type` | `Payment.SettlementRequired.Capture` or `Payment.SettlementRequired.Void` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the order event that triggered the request |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -368,8 +415,7 @@ Headers:
 | `X-Type` | `Payment.Timeout` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the order event that triggered the timeout |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -396,8 +442,7 @@ Headers:
 | `X-Type` | `Payment.Authorized` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -421,8 +466,7 @@ Headers:
 | `X-Type` | `Payment.Charged` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -446,8 +490,7 @@ Headers:
 | `X-Type` | `Payment.Captured` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -471,8 +514,7 @@ Headers:
 | `X-Type` | `Payment.Failed` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -496,8 +538,7 @@ Headers:
 | `X-Type` | `Payment.Voided` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
 Payload:
 
@@ -514,6 +555,10 @@ Payload:
 
 #### `payment.requires_action`
 
+> Not emitted as its own outbox event. When Stripe returns `requires_action` (3DS/SCA), the payment service maps the payment directly to `FAILED` in the orchestration flow (3DS/SCA is not supported in this version) and publishes `payment.failed` instead.
+
+For reference, the internal `PaymentRequiresAction` domain event is raised but never written to the outbox:
+
 Headers:
 
 | Header | Example |
@@ -521,17 +566,15 @@ Headers:
 | `X-Type` | `Payment.RequiresAction` |
 | `X-Id` | `uuid` |
 | `X-Correlation-Id` | `uuid` |
-| `X-Causation-Id` | `uuid` of the triggering request or webhook |
-| `X-Trace-Id` | tracing id |
+| `traceparent` | W3C trace context (optional, used for distributed tracing) |
 
-Payload:
+Payload (internal domain event only; never published):
 
 ```json
 {
   "paymentId": "uuid",
   "orderId": "uuid",
-  "paymentIntentId": "pi_...",
-  "amount": 125.50,
+  "paymentIntentId": "pi_..."
 }
 ```
 
@@ -539,22 +582,25 @@ Payload:
 
 ### 5.5 Required Headers
 
+Both inbound and outbound messages use the same set of headers:
+
 | Header | Purpose |
 |---|---|
-| `X-Id` | Unique message id for inbox/outbox dedupe |
+| `X-Id` | Unique message id for message dedupe |
 | `X-Type` | Event or command type |
 | `X-Correlation-Id` | Correlates payment request with the order flow |
-| `X-Causation-Id` | Optional, points to the triggering message id |
-| `X-Trace-Id` | Optional distributed-tracing identifier |
+| `traceparent` | Optional W3C trace context (distributed tracing) |
 
-The inbox/outbox persistence model mirrors these headers:
+The payment service does **not use an `X-Causation-Id` header** at all — neither the messages it consumes nor the events it publishes carry one.
+
+The persistence models mirror these headers:
 
 - `message_id` stores `X-Id`
 - `correlation_id` stores `X-Correlation-Id`
-- `causation_id` stores `X-Causation-Id`
-- `trace_id` stores `X-Trace-Id`
+- `causation_id` is always left null (the service does not consume or produce a causation header)
+- `trace_id` stores the trace id (derived from `traceparent` on inbound, or the current Micrometer trace on outbound)
 
-### 5.5 Payload rule
+### 5.6 Payload rule
 
 The payload for every message must contain only business data.
 
@@ -582,7 +628,6 @@ sequenceDiagram
     participant X as Outbox
 
     O->>P: order.payments_requested [X-Type=Payment.InitRequired.Charge]
-    P->>P: save inbox message
     P->>S: create and confirm PaymentIntent
     S-->>P: succeeded or failed
     P->>P: update Payment
@@ -594,11 +639,10 @@ sequenceDiagram
 Typical sequence:
 
 1. Order Service creates the order and publishes `order.payments_requested` with `X-Type=Payment.InitRequired.Charge`.
-2. Payment Service stores the message in the inbox table.
-3. Payment Service loads the payment method and creates the Stripe PaymentIntent.
-4. If Stripe confirms the payment, Payment Service marks the payment as `CHARGED`.
-5. Payment Service writes `payment.charged` to the outbox.
-6. Order Service consumes `payment.charged` and confirms the order.
+2. Payment Service loads the payment method and creates the Stripe PaymentIntent.
+3. If Stripe confirms the payment, Payment Service marks the payment as `CHARGED`.
+4. Payment Service writes `payment.charged` to the outbox.
+5. Order Service consumes `payment.charged` and confirms the order.
 
 If Stripe declines:
 
@@ -720,41 +764,40 @@ flowchart LR
 
 ## 7. API Surface
 
-The broker-driven flow is the primary path, but the service still exposes supporting APIs for setup, inspection, replay, and operational safety.
+The broker-driven flow is the primary path, but the service still exposes supporting APIs for setup and inspection. All buyer-scoped endpoints read the caller identity from the `X-User-Id` request header.
 
 ### 7.1 Payment Methods
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/payment-methods` | Save a buyer payment method or setup-intent result |
-| `GET` | `/api/payment-methods` | List buyer payment methods |
-| `GET` | `/api/payment-methods/{id}` | Get one payment method |
-| `PATCH` | `/api/payment-methods/{id}/default` | Mark one payment method as the default method |
-| `DELETE` | `/api/payment-methods/{id}` | Remove a saved payment method |
+| `GET` | `/api/payment-methods` | List the buyer's saved payment methods (masked) |
+| `GET` | `/api/payment-methods/{methodId}` | Get one of the buyer's saved payment methods |
+| `POST` | `/api/payment-methods/setup-intent` | Start adding a card via a Stripe SetupIntent (returns client secret) |
+| `POST` | `/api/payment-methods` | Confirm a completed SetupIntent and save the payment method (returns `201 Created`, or `200 OK` if the card was already saved) |
+| `PUT` | `/api/payment-methods/{methodId}/default` | Set the buyer's default payment method |
+| `DELETE` | `/api/payment-methods/{methodId}/default` | Clear the default flag (no silent promotion) |
+| `DELETE` | `/api/payment-methods/{methodId}` | Hard-delete a saved payment method |
+
 ### 7.2 Payment Status
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/payments/{id}` | Inspect payment state |
-| `GET` | `/api/payments/order/{orderId}` | Inspect payment(s) by order |
-| `GET` | `/api/payments/user/{userId}` | Inspect payments for a user |
-| `GET` | `/api/payments/status/{status}` | Search payments by lifecycle status |
-| `POST` | `/api/payments/{id}/authorize` | Internal or operator-assisted authorization |
-| `POST` | `/api/payments/{id}/capture` | Internal or operator-assisted settlement capture |
-| `POST` | `/api/payments/{id}/void` | Internal or operator-assisted void |
-| `POST` | `/api/payments/{id}/fail` | Internal recovery endpoint to mark a payment failed |
-| `POST` | `/api/payments/{id}/refund` | Optional refund flow if refund support is enabled |
+| `POST` | `/api/payments` | Create a payment locally (resolve it via the broker `order.payments_requested` flow) |
+| `GET` | `/api/payments/{paymentId}` | Inspect payment state |
+| `GET` | `/api/payments/user/{userId}` | Inspect payments for a user (caller `X-User-Id`, with path override available) |
+| `GET` | `/api/payments/order/{orderId}` | Inspect the payment(s) for an order |
+| `POST` | `/api/payments/{paymentId}/authorize` | Internal or operator-assisted authorization |
+| `POST` | `/api/payments/{paymentId}/capture` | Internal or operator-assisted settlement capture |
+| `POST` | `/api/payments/{paymentId}/fail` | Internal recovery endpoint to mark a payment failed |
+| `POST` | `/api/payments/{paymentId}/void` | Internal or operator-assisted void |
 
 ### 7.3 Broker Intake
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/webhooks/stripe` | Verify Stripe signatures and ingest webhook events |
-| `POST` | `/api/internal/messages/replay` | Replay a stored inbox message under operator control |
-| `POST` | `/api/internal/outbox/{id}/republish` | Republish one outbox record after inspection |
-| `POST` | `/api/internal/outbox/retry` | Retry a batch of failed outbox records |
+| `POST` | `${stripe.webhook-path}` (default `/api/v1/payments/webhook`) | Verify Stripe signatures and ingest webhook events |
 
-### 7.4 Reliability and Ops
+### 7.4 Reliability and Ops (Actuator)
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -762,16 +805,13 @@ The broker-driven flow is the primary path, but the service still exposes suppor
 | `GET` | `/actuator/info` | Build and deployment metadata |
 | `GET` | `/actuator/metrics` | Runtime metrics |
 | `GET` | `/actuator/prometheus` | Prometheus scrape endpoint |
-| `GET` | `/actuator/loggers` | Logging diagnostics if enabled |
 
-### 7.5 Optional diagnostics
+### 7.5 API documentation
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/internal/inbox` | Inspect inbox rows for support/debugging |
-| `GET` | `/api/internal/inbox/failed` | List failed inbox rows |
-| `GET` | `/api/internal/outbox` | Inspect outbox rows for support/debugging |
-| `GET` | `/api/internal/outbox/pending` | List pending outbox rows |
+| `GET` | `/api-docs` | OpenAPI JSON description |
+| `GET` | `/swagger-ui.html` | Swagger UI for interactive API exploration |
 
 ---
 
@@ -820,7 +860,8 @@ For Rally, keep the contract names aligned with Order Service.
 - `Payment.Captured`
 - `Payment.Failed`
 - `Payment.Voided`
-- `Payment.RequiresAction`
+
+(Note: `Payment.Initialized`, `Payment.RequiresAction`, and `Payment.Refunded` are internal-only domain events and are not published to `payment.events`.)
 
 Keep topic names lowercase and domain-oriented. Keep `X-Type` values as the message contract identifiers, and keep enum casing only in code-level models where needed.
 
