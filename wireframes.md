@@ -1,84 +1,118 @@
 # Wireframes
 
-Low-fidelity wireframes for the GroupDeal platform, organized by user flow. Source images
+Low-fidelity wireframes for the RALLY platform, organized by user flow. Source images
 live in [`assets/wireframes/`](assets/wireframes/).
-
----
-
-## Auth
-
-### Login
-<img src="assets/wireframes/Login.png" alt="Login wireframe" width="600">
-
-### Register
-<img src="assets/wireframes/Register.png" alt="Register wireframe" width="600">
 
 ---
 
 ## Public / Buyer Browsing
 
-### Landing Page
-<img src="assets/wireframes/Landing%20Page.png" alt="Landing Page wireframe" width="600">
+### Home
+Landing page with active-deal callouts, platform stats, a "how it works" explainer, and
+featured deals close to unlocking their next price tier.
 
-### About GroupDeal
-<img src="assets/wireframes/About%20GroupDeal.png" alt="About GroupDeal wireframe" width="600">
-
-### Contact Us
-<img src="assets/wireframes/Contact%20Us.png" alt="Contact Us wireframe" width="600">
-
-### Products
-<img src="assets/wireframes/Products.png" alt="Products listing wireframe" width="600">
-
-### Product Details
-<img src="assets/wireframes/Product%20Details.png" alt="Product Details wireframe" width="600">
+<img src="assets/wireframes/01-home.png" alt="Home wireframe" width="600">
 
 ### Browse Group Deals
-<img src="assets/wireframes/Browse%20Group%20Deals.png" alt="Browse Group Deals wireframe" width="600">
+Filterable, searchable list of active group deals showing progress, spots left, and
+time remaining for each.
+
+<img src="assets/wireframes/02-browse-deals.png" alt="Browse Group Deals wireframe" width="600">
 
 ### Deal Details
-Shows the shared participant pool, stock cap, and countdown timer for a single deal.
+Single deal page with join/invite actions, live participant progress toward the
+minimum and target, deal milestones, and live activity/FAQ tabs.
 
-<img src="assets/wireframes/Deal%20Details.png" alt="Deal Details wireframe" width="600">
+<img src="assets/wireframes/03-deal-details.png" alt="Deal Details wireframe" width="600">
+
+### Browse Products
+Filterable, searchable catalog of admin-approved products, including items with an
+active group deal badge.
+
+<img src="assets/wireframes/04-browse-products.png" alt="Browse Products wireframe" width="600">
+
+### Product Details
+Standard product page with quantity, add-to-cart, and recommended products.
+
+<img src="assets/wireframes/05-product-details.png" alt="Product Details wireframe" width="600">
 
 ---
 
-## Buyer Checkout & Account
-
-### Create Group Deal
-Buyer-initiated flow to start a new group deal on a product.
-
-<img src="assets/wireframes/Create%20Group%20Deal.png" alt="Create Group Deal wireframe" width="600">
+## Buyer Cart
 
 ### Shopping Cart
-<img src="assets/wireframes/Shopping%20Cart.png" alt="Shopping Cart wireframe" width="600">
+Empty-state shown; prompts the buyer back to product browsing.
 
-### Order Details - Standard Order
-Order confirmation for a normal, non-group purchase at base price.
-
-<img src="assets/wireframes/Order%20Details%20-%20Standard%20Order.png" alt="Order Details - Standard Order wireframe" width="600">
-
-### Order Details - Group Deal (Aligned)
-Order confirmation once a group deal has succeeded and holds are captured.
-
-<img src="assets/wireframes/Order%20Details%20-%20Group%20Deal%20(Aligned).png" alt="Order Details - Group Deal (Aligned) wireframe" width="600">
-
-### User Profile
-<img src="assets/wireframes/User%20Profile.png" alt="User Profile wireframe" width="600">
+<img src="assets/wireframes/06-cart.png" alt="Shopping Cart wireframe" width="600">
 
 ---
 
 ## Seller Flow
 
-### Seller Dashboard
-<img src="assets/wireframes/Seller%20Dashboard.png" alt="Seller Dashboard wireframe" width="600">
+### Deals
+Seller dashboard listing all group deal campaigns with revenue, participant, and
+completion stats, filterable by status (active, pending, succeeded, failed, cancelled).
 
-### Product Management
-<img src="assets/wireframes/Product%20Management.png" alt="Product Management wireframe" width="600">
+<img src="assets/wireframes/07-seller-deals.png" alt="Seller Deals wireframe" width="600">
 
-### Add New Product
-<img src="assets/wireframes/Add%20New%20Product.png" alt="Add New Product wireframe" width="600">
+### Deal Detail
+Single campaign view for a seller showing price, progress toward the minimum/target,
+and the list of joined participants.
 
-### Manage Group Deals
-Seller view for tracking deal-level stock cap, participant count, and timer status.
+<img src="assets/wireframes/08-seller-deal-detail.png" alt="Seller Deal Detail wireframe" width="600">
 
-<img src="assets/wireframes/Manage%20Group%20Deals.png" alt="Manage Group Deals wireframe" width="600">
+### New Deal
+Form to configure a new group deal campaign from an approved product: pricing, deal
+stock/capacity, minimum participants, and schedule, with a live preview and campaign
+summary.
+
+<img src="assets/wireframes/17-seller-create-deal.png" alt="Seller New Deal wireframe" width="600">
+
+### Product Inventory
+Seller's storefront listings with stock levels, approval status, and group pricing.
+
+<img src="assets/wireframes/09-seller-products.png" alt="Seller Product Inventory wireframe" width="600">
+
+### New Product
+Form to submit a new product listing for admin approval: basic info, pricing &
+inventory, media, and visibility.
+
+<img src="assets/wireframes/16-seller-create-product.png" alt="Seller New Product wireframe" width="600">
+
+### Orders
+Seller's order history with revenue and status breakdown (pending, delivered,
+cancelled).
+
+<img src="assets/wireframes/10-seller-orders.png" alt="Seller Orders wireframe" width="600">
+
+---
+
+## Admin Flow
+
+### Product Approvals
+Queue of seller-submitted products awaiting admin approval or rejection.
+
+<img src="assets/wireframes/11-product-approvals.png" alt="Product Approvals wireframe" width="600">
+
+### User Management
+Admin view of all buyers and sellers, with status and the ability to restrict
+accounts.
+
+<img src="assets/wireframes/12-user-management.png" alt="User Management wireframe" width="600">
+
+### Seller Management
+Admin view of seller accounts, their product counts, and pending approvals per
+seller.
+
+<img src="assets/wireframes/13-seller-management.png" alt="Seller Management wireframe" width="600">
+
+### Deals Management
+Platform-wide view of all group deal campaigns with status and progress, across all
+sellers.
+
+<img src="assets/wireframes/14-deals-management.png" alt="Deals Management wireframe" width="600">
+
+### Categories Management
+Admin CRUD for product categories and their assigned inventory counts.
+
+<img src="assets/wireframes/15-categories-management.png" alt="Categories Management wireframe" width="600">
