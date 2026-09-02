@@ -112,26 +112,35 @@ erDiagram
 
     %% ---------------- ORDER SERVICE ----------------
     ORDERS {
-        uuid id PK
-        uuid user_id "ref: User Service (no FK)"
-        varchar order_type "NORMAL / DEAL"
-        uuid deal_id "ref: Deal Service (no FK), required if DEAL"
-        uuid participant_id "required if DEAL"
-        varchar status
-        numeric total_price
-        uuid payment_id "ref: Payment Service (no FK)"
-        varchar payment_intent_id "denormalized from Payment Service"
-        varchar cancel_reason
-        int version
-        timestamptz created_at
-        timestamptz updated_at
-        timestamptz status_updated_at
+        id uuid
+        user_id uuid
+        order_type varchar
+        deal_id uuid
+        participant_id uuid
+        status varchar
+        total_price numeric
+        address text
+        payment_id uuid
+        card_last4 varchar
+        card_brand varchar
+        card_exp_month varchar
+        card_exp_year varchar
+        cancel_reason varchar
+        payment_error_code varchar
+        payment_error_message text
+        shipping_status varchar
+        shipping_status_updated_at timestamptz
+        version int
+        created_at timestamptz
+        updated_at timestamptz
+        status_updated_at timestamptz
     }
 
     ORDER_PRODUCTS {
         uuid id PK
         uuid order_id FK
         uuid product_id "ref: Catalog Service (no FK)"
+        uuid seller_id "ref: User Service (no FK)"
         int quantity
         numeric unit_price "price snapshot at order time"
         timestamptz created_at
@@ -165,6 +174,7 @@ erDiagram
         uuid id PK
         uuid product_id "ref: Catalog Service (no FK)"
         uuid seller_id "ref: User Service (no FK)"
+        uuid category_id "ref: Catalog Service (no FK)"
         numeric original_price "snapshot of product.base_price at creation"
         numeric deal_price "absolute price paid on success, not a discount"
         int deal_stock "deal-level cap, distinct from Inventory stock"
