@@ -70,6 +70,7 @@ CREATE TYPE deal_status AS ENUM ('pending', 'active', 'succeeded', 'failed', 'ca
 CREATE TABLE deals (
     id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     product_id            UUID NOT NULL,
+    category_id           UUID,
     seller_id             UUID NOT NULL,
 
     original_price        NUMERIC(10,2) NOT NULL CHECK (original_price > 0), -- snapshot of product.base_price from Catalog Service at creation time; never updated afterward, even if the seller edits the product later
@@ -97,6 +98,8 @@ CREATE TABLE deals (
 CREATE INDEX idx_deals_status            ON deals (status);
 CREATE INDEX idx_deals_seller_id         ON deals (seller_id, status);
 CREATE INDEX idx_deals_product_id        ON deals (product_id);
+CREATE INDEX idx_deals_category_id       ON deals (category_id);
+CREATE INDEX idx_deals_category_status   ON deals (category_id, status);
 -- Powers the internal timer sweep (§6):
 CREATE INDEX idx_deals_active_end_time   ON deals (end_time) WHERE status = 'active';
 ```
@@ -140,13 +143,33 @@ CREATE TABLE deal_slot_requests (
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
 | POST | `/deals` | Seller | Create a deal on a product the caller owns |
-| GET | `/deals` | Any | Browse/filter deals — query params: `status`, `sellerId`, `productId`, `page`, `size` |
-| GET | `/deals/{id}` | Any | Deal detail, including live progress (`currentParticipants`/`dealStock`, `timeRemainingSeconds`) |
+| PATCH | `/deals/{id}` | Seller (owner) | Update deal — only legal while `pending` with zero participants |
 | POST | `/deals/{id}/cancel` | Seller (owner) | Cancel — only legal while `pending` |
+| POST | `/deals/bulk` | Any | Fetch multiple deals by IDs and optional status filter |
+| GET | `/deals` | Any | Browse/filter deals with pagination, sorting, and search |
+| GET | `/deals/{id}` | Any | Deal detail — live progress, no enrichment (gateway enriches) |
+| GET | `/deals/analytics` | Any (sellerId optional) | Platform-wide or per-seller analytics summary |
+| GET | `/deals/seller-stats` | Seller | Seller-facing stats: active deals, revenue, participants, completion rate |
 
 `GET /deals?sellerId={id}&status=succeeded,failed` covers DS-04 (seller outcome view).
 `GET /deals?status=...` with no `sellerId` (admin role) covers DS-05. No separate endpoints
 needed for either — one filterable list endpoint serves both.
+
+**GET `/deals` query parameters (all optional):**
+
+| Param | Type | Description |
+|---|---|---|
+| `categories` | `UUID[]` | Filter by one or more category UUIDs |
+| `minPrice` | `BigDecimal` | Minimum deal price (inclusive) |
+| `maxPrice` | `BigDecimal` | Maximum deal price (inclusive) |
+| `sort` | `String` | `relevance` (default) \| `price-asc` \| `price-desc` \| `discount` \| `ending-soon` \| `most-joined` \| `newest` |
+| `sellerId` | `UUID` | Filter by seller |
+| `status` | `DealStatus[]` | Comma-separated or repeated; defaults to `ACTIVE,PENDING`; use `ALL` for every status |
+| `productId` | `UUID` | Filter by product (for product detail page) |
+| `page` | `int` | 0-based page index (default 0) |
+| `limit` | `int` | Page size (default 20) |
+
+**Default sort is `relevance`** — a composite score (discount 40% + momentum 30% + urgency 30%).
 
 ### 4.2 Internal (service-to-service, sync, not gateway-routed)
 
@@ -157,6 +180,7 @@ needed for either — one filterable list endpoint serves both.
 | POST | `/internal/deals/{id}/release-slot` | Order Service | Release a slot whose payment was declined **before** authorization ever succeeded; decrements `current_participants` only |
 | POST | `/internal/deals/{id}/authorize-slot` | Order Service | **NEW.** Marks a reserved slot as payment-authorized; increments `authorized_count`; may flip `active→succeeded` if this fills `deal_stock` |
 | POST | `/internal/deals/{id}/release-authorized-slot` | Order Service | **NEW.** Releases an **already-authorized** slot whose participant subsequently left; decrements both `current_participants` and `authorized_count` |
+| GET | `/internal/deals/product/{productId}/has-active-deals` | Catalog Service | **NEW.** Determines if a product has any active or pending deals; used to prevent product price changes or deletion. |
 
 ---
 
@@ -168,6 +192,7 @@ Request:
 ```json
 {
   "productId": "8a2c1f0e-...",
+  "categoryId": "5f3a2b1c-...",
   "dealPrice": 149.99,
   "dealStock": 100,
   "minParticipants": 40,
@@ -184,6 +209,7 @@ Response `201 Created`:
 {
   "id": "9e1c4b7a-...",
   "productId": "8a2c1f0e-...",
+  "categoryId": "5f3a2b1c-...",
   "sellerId": "331f2a90-...",
   "originalPrice": 199.99,
   "dealPrice": 149.99,
@@ -206,37 +232,144 @@ couldn't reserve the requested `dealStock`).
 
 ### 5.2 `GET /deals` / `GET /deals/{id}`
 
-`DealResponse` (list and detail share the shape; detail adds `timeRemainingSeconds`):
+**`DealOverview`** — used by `GET /deals` (list, paginated):
 ```json
 {
   "id": "9e1c4b7a-...",
   "productId": "8a2c1f0e-...",
   "sellerId": "331f2a90-...",
+  "categoryId": "5f3a2b1c-...",
   "originalPrice": 199.99,
   "dealPrice": 149.99,
   "dealStock": 100,
   "currentParticipants": 68,
-  "authorizedCount": 63,
   "minParticipants": 40,
+  "authorizedCount": 63,
   "status": "active",
-  "startTime": "2026-07-12T10:15:00Z",
   "durationMinutes": 1440,
+  "startTime": "2026-07-12T10:15:00Z",
   "endTime": "2026-07-13T10:15:00Z",
-  "timeRemainingSeconds": 41230,
   "createdAt": "2026-07-12T10:00:00Z"
 }
 ```
-`currentParticipants` and `authorizedCount` diverging (68 vs. 63) is normal and expected —
-the gap is people who joined but whose payment authorization is still in flight or was
-declined. `GET /deals` wraps this in a standard page envelope:
-`{ content: DealResponse[], page, size, totalElements }`.
+
+**`DealDetails`** — used by `GET /deals/{id}` (single deal):
+```json
+{
+  "id": "9e1c4b7a-...",
+  "productId": "8a2c1f0e-...",
+  "sellerId": "331f2a90-...",
+  "categoryId": "5f3a2b1c-...",
+  "originalPrice": 199.99,
+  "dealPrice": 149.99,
+  "dealStock": 100,
+  "currentParticipants": 68,
+  "minParticipants": 40,
+  "authorizedCount": 63,
+  "status": "active",
+  "durationMinutes": 1440,
+  "startTime": "2026-07-12T10:15:00Z",
+  "endTime": "2026-07-13T10:15:00Z",
+  "createdAt": "2026-07-12T10:00:00Z"
+}
+```
+
+Both DTOs contain **only deal-table fields** (16 fields). Computed fields
+(`neededCount`, `progressPercent`, `timeRemainingInSeconds`) and catalog enrichment
+(`productName`, `productImageUrl`, `category`, `sku`, `sellerName`, `productDescription`,
+`productImages`) are **omitted** — the API Gateway handles enrichment/computation.
+
+`GET /deals` wraps `DealOverview` in a standard page envelope:
+`{ content: DealOverview[], page, size, totalElements, totalPages }`.
 
 ### 5.3 `POST /deals/{id}/cancel`
 
 No body. Response `200 OK` → `DealResponse` with `status: "cancelled"`.
 Errors: `409 DEAL_ALREADY_STARTED` (one or more participants already joined).
 
-### 5.4 `POST /internal/deals/{id}/reserve-slot`
+### 5.4 `GET /deals/analytics`
+
+Response `200 OK` — `DealAnalyticsResponse`:
+```json
+{
+  "totalDeals": 1542,
+  "dealsThisMonth": 87,
+  "activeDeals": 23,
+  "dealsToday": 5,
+  "completedDeals": 1204,
+  "successRate": 87.4
+}
+```
+
+| Field | Description |
+|---|---|
+| `totalDeals` | All deals ever created |
+| `dealsThisMonth` | Deals created this calendar month |
+| `activeDeals` | Status `ACTIVE` or `PENDING` |
+| `dealsToday` | Deals created today (UTC) |
+| `completedDeals` | Status `SUCCEEDED` only (terminal success) |
+| `successRate` | `succeeded / (succeeded + failed) * 100` |
+
+Optional `X-User-Id` header filters to that seller's deals.
+
+### 5.5 `GET /deals/seller-stats`
+
+Response `200 OK` — `SellerStatsResponse`:
+```json
+{
+  "activeDealCnt": 3,
+  "totalRevenue": "299.98",
+  "participantsJoined": 2,
+  "avgCompletionRate": 1.0
+}
+```
+
+| Field | Description |
+|---|---|
+| `activeDealCnt` | Deals with status `ACTIVE` or `PENDING` |
+| `totalRevenue` | Sum of `dealPrice * authorizedCount` for `SUCCEEDED` deals |
+| `participantsJoined` | Sum of `authorizedCount` for `SUCCEEDED` deals |
+| `avgCompletionRate` | `succeededCount / (succeededCount + failedCount)` |
+
+Requires `X-User-Id` header (seller UUID).
+
+### 5.6 `PATCH /deals/{id}`
+
+Request body (`UpdateDealRequest`):
+```json
+{
+  "dealPrice": 129.99,
+  "dealStock": 150,
+  "minParticipants": 10,
+  "durationMinutes": 1440
+}
+```
+Only allowed while deal is `PENDING` with zero `currentParticipants`.
+Re-validates `dealPrice < originalPrice` and `minParticipants <= dealStock`.
+Adjusts inventory reservation for stock delta.
+
+Response `200 OK` → `DealResponse` with updated fields.
+Errors: `409 DEAL_ALREADY_STARTED`, `400 DEAL_PRICE_NOT_BELOW_ORIGINAL_PRICE`.
+
+### 5.7 `POST /deals/bulk`
+
+Request body (`BulkDealRequest`):
+```json
+{
+  "ids": ["id1", "id2", "id3"],
+  "statuses": ["ACTIVE", "PENDING"]
+}
+```
+`statuses` is optional filter.
+
+Response `200 OK` — `DealResponse[]` for matching deals.
+
+### 5.8 `POST /deals/{id}/cancel`
+
+No body. Response `200 OK` → `DealResponse` with `status: "cancelled"`.
+Errors: `409 DEAL_ALREADY_STARTED` (one or more participants already joined).
+
+### 5.9 `POST /internal/deals/{id}/reserve-slot`
 
 Request:
 ```json
@@ -278,7 +411,7 @@ an expected business outcome, not a fault):
 checked against `current_participants < dealStock` here — **not** `authorized_count` —
 since joining is "intent," not payment.
 
-### 5.5 `POST /internal/deals/{id}/release-slot`
+### 5.10 `POST /internal/deals/{id}/release-slot`
 
 For a slot whose payment was declined **before** it was ever authorized. Decrements
 `current_participants` only — `authorized_count` was never incremented for this slot, so
@@ -298,7 +431,7 @@ Request/response:
 { "success": true, "dealId": "9e1c4b7a-...", "currentParticipants": 63, "authorizedCount": 59, "status": "active" }
 ```
 
-### 5.6 `POST /internal/deals/{id}/authorize-slot` *(new)*
+### 5.11 `POST /internal/deals/{id}/authorize-slot`
 
 Called by Order Service when it consumes `payment.authorized`. Request/response mirror
 reserve-slot:
@@ -321,13 +454,13 @@ response reflects `succeeded` — the same transaction that increments the count
 resolves the deal, mirroring how reserve-slot already handles the `pending→active`
 transition atomically.
 
-Rejected response (**ٍshould be rare** — a slot reaching authorization implies it was already
+Rejected response (**should be rare** — a slot reaching authorization implies it was already
 reserved, but the deal could have been resolved in between by the sweep):
 ```json
 { "success": false, "dealId": "9e1c4b7a-...", "reason": "DEAL_NOT_JOINABLE" }
 ```
 
-### 5.7 `POST /internal/deals/{id}/release-authorized-slot`
+### 5.12 `POST /internal/deals/{id}/release-authorized-slot`
 
 For a slot that **was** authorized, then the participant left (`participant.left` →
 Order Service voids the payment). Decrements both counters together. **Confirmed** by both
@@ -341,10 +474,10 @@ previously an open question about a flag vs. a separate endpoint.
 { "success": true, "dealId": "9e1c4b7a-...", "currentParticipants": 63, "authorizedCount": 58, "status": "active" }
 ```
 
-### 5.8 `GET /internal/deals/{id}/check-leave-eligible` *(new)*
+### 5.13 `GET /internal/deals/{id}/check-leave-eligible`
 
 Called by Participation Service **before** it commits to processing a leave request — a
-read-only permission check, distinct from `release-authorized-slot` (§5.7), which happens
+read-only permission check, distinct from `release-authorized-slot` (§5.12), which happens
 later, once the async void actually completes. Modifies nothing.
 
 No request body (path param only).
@@ -370,25 +503,38 @@ with `reserve-slot`: joining has no time cutoff and remains legal right up to `e
 only leaving is cut off 10 minutes early, so a late-arriving swap can't itself be undone
 last-minute in a way that would destabilize a deal that's about to resolve.
 
+### 5.14 `GET /internal/deals/product/{productId}/has-active-deals`
+
+Called by Catalog Service to determine if a product has any active or pending deals.
+Used to prevent changes to a product's price or deletion if a deal is currently ongoing mapped to that product.
+
+No request body (path param only).
+
+Response `200 OK`:
+```json
+{
+  "productId": "8a2c1f0e-...",
+  "hasActiveDeals": true
+}
+```
+
 ---
 
 ## 6. Communication With Other Services
 
 Deal Service **subscribes to no events** — it is a pure publisher plus a synchronous callee.
 This is intentional: it must never take orders from another service about its own state.
-**Confirmed by Order Service's own doc**: it explicitly notes `authorized_count++` happens
-via the sync `authorize-slot` RPC, "not by consuming this event" — validating this rule
-rather than contradicting it.
 
 ### 6.1 Synchronous (Deal Service as callee)
 
 | Caller | Endpoint | When |
 |---|---|---|
-| Participation Service | `reserve-slot` | Buyer requests to join (§5.4) |
-| Participation Service | `check-leave-eligible` | Buyer requests to leave, checked before Participation Service commits to processing it (§5.8) |
-| Order Service | `release-slot` | Payment declined **before** authorization (§5.5) — confirmed present in Order Service's updated doc |
-| Order Service | `authorize-slot` | `payment.authorized` consumed (§5.6) |
-| Order Service | `release-authorized-slot` | `payment.voided` consumed on the leave path, i.e. `participant.left` → void completes on an already-authorized order (§5.7) |
+| Participation Service | `reserve-slot` | Buyer requests to join (§5.9) |
+| Participation Service | `check-leave-eligible` | Buyer requests to leave, checked before Participation Service commits to processing it (§5.13) |
+| Order Service | `release-slot` | Payment declined **before** authorization (§5.10) — confirmed present in Order Service's updated doc |
+| Order Service | `authorize-slot` | `payment.authorized` consumed (§5.11) |
+| Order Service | `release-authorized-slot` | `payment.voided` consumed on the leave path, i.e. `participant.left` → void completes on an already-authorized order (§5.12) |
+| Catalog Service | `has-active-deals` | Before evaluating whether to permit editing or deleting a product catalog entry (§5.14) |
 
 
 ### 6.2 Synchronous (Deal Service as caller)
@@ -404,11 +550,6 @@ All events are emitted via the outbox (§3) onto a Kafka topic, **keyed by `deal
 Kafka guarantees ordering per deal (critical: a `succeeded` must never be reordered behind a
 stale `active` update for the same deal).
 
-**REVISED — payload casing**: Order Service's and Payment Service's own Kafka payloads are
-consistently snake_case (`deal_id`, `order_id`, `authorized_count`), while their synchronous
-REST bodies are camelCase (`orderId`, `totalPrice`). The events below now follow that same
-split — snake_case here, camelCase everywhere in §5's sync contracts — to match sibling
-services exactly rather than introduce a third convention.
 
 **`deal.created`**
 ```json
@@ -499,7 +640,7 @@ Consumers:
 
 | Consumer | What it needs from Deal Service | How it gets it |
 |---|---|---|
-| Catalog Service | Nothing — Deal Service only reads from it | N/A (not a consumer of Deal Service data) |
+| Catalog Service | Whether a product currently has active/pending deals | Sync response from `has-active-deals` (§5.9) |
 | Participation Service | Whether a slot was reserved, plus `dealPrice` (to forward downstream); whether a leave is currently permitted | Sync response from `reserve-slot` (§5.4); sync response from `check-leave-eligible` (§5.8) |
 | Order Service | `dealPrice` at join time; `authorized_count`/`deal_stock` at resolution time; slot-authorize/release acknowledgment | `dealPrice` arrives indirectly via Participation Service's `participant.joined` event; `authorize-slot`/`release-slot`/`release-authorized-slot` are synchronous calls Order Service makes into Deal Service (§5.6/§5.5/§5.7); `deal.succeeded`/`deal.failed` (§6.3) drive Order Service's batch settlement |
 | Inventory Service | `product_id` + unit count to release or finalize | `deal.cancelled` (release), `deal.succeeded` (finalize as sold), `deal.failed` (release) |
